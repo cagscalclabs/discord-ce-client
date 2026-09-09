@@ -1,0 +1,22 @@
+{
+  "DISCORD_TOKEN": "",
+  "PERMISSIONS": 68608,
+  "RELAY_HOST": "0.0.0.0",
+  "RELAY_PORT": 8443,
+  "RELAY_CERT": "relay_cert.pem",
+  "RELAY_KEY": "relay_key.pem",
+  "DATABASE_FILE": "relay.sqlite3",
+  "DISCORD_DISPLAY_FMT": "[{user}] {text}",
+  "SESSION_TTL": 3600,
+  "LOGIN_TIMEOUT": 600,
+  "MAX_CLIENTS": 64,
+  "MAX_CLIENTS_PER_IP": 4,
+  "MAX_SESSIONS": 1024,
+  "SEND_INTERVAL": 2,
+  "oidc": {
+    "issuer": "https://account.ceagle.cc",
+    "client_id": "",
+    "client_secret": "",
+    "token_endpoint_auth_method": "none"
+  }
+}

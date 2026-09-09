@@ -53,3 +53,14 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Local relay configuration and credentials
+/relay/config.json
+/relay/users.json
+/relay/*.pem
+/relay/*.sqlite3*
+__pycache__/
+.venv/
+
+
+relay/config.json
