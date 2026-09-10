@@ -1,1223 +1,551 @@
-/**
- * lwIP-CE Discord Relay Client — self-contained UI
- *
- * Connects to relay.py over TLS TCP.  The relay bridges to Discord.
- *
- * Line protocol:
- *   Calc → Relay:  AUTH <user> <pin>\n
- *                  SEND <text>\n
- *                  CHAN <#name>\n
- *   Relay → Calc:  OK\n
- *                  DENIED\n
- *                  RELAY_CHAN <#ch1>,<#ch2>,...\n
- *                  RELAY_ACTIVE <#name>\n
- *                  MSG <author>: <text>\n
- *                  SYS <text>\n
- *
- * Screen layout (320x240, 8x8 font):
- *
- *   x=0       x=64 x=66                         x=319
- *   +---------+--+-------------------------------+
- *   | Channels|  | #general | username        y=0-7 (title bar)
- *   +---------+  +-------------------------------+
- *   | #general|  | <alice> hello there       y=8
- *   | #random |  | * connected               y=16
- *   | #gaming |  | ...                       ...
- *   |         |  |                               |
- *   |         |  +-------------------------------+
- *   |         |  | a hello_                  y=input
- *   +---------+--+-------------------------------+
- *
- * Controls:
- *   [alpha]    cycle input mode: abc -> ABC -> 123
- *   [2nd]      shift-once to upper for next char
- *   [enter]    send message
- *   [del]      backspace
- *   [clear]    clear input line
- *   [up/down]  scroll channel list and switch active channel
- *   [stat]     toggle memory overlay
- *   [mode]     disconnect and exit
- */
-
+/* Discord-CE: bounded protocol-v2 client for lwIP-CE. */
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
-#include <ctype.h>
-
+#include "wire.h"
+#ifdef DISCORD_TEST
+#include "../tests/platform.h"
+#else
 #include <ti/getcsc.h>
 #include <fileioc.h>
 #include <graphx.h>
-
 #include <lwip.h>
-#include "../../common/lwip_example.h"
-
-/* ---------------------------------------------------------------------- */
-/* Build-time configuration                                                */
-/* ---------------------------------------------------------------------- */
+#include "lwip_example.h"
+#endif
 
 #ifndef RELAY_DEFAULT_HOST
 #define RELAY_DEFAULT_HOST ""
 #endif
-
 #ifndef RELAY_DEFAULT_PORT
-#define RELAY_DEFAULT_PORT "8443"
+#define RELAY_DEFAULT_PORT 8443
+#endif
+#if RELAY_DEFAULT_PORT < 1 || RELAY_DEFAULT_PORT > 65535
+#error RELAY_DEFAULT_PORT must be between 1 and 65535
 #endif
 
-#ifndef RELAY_CONNECT_TIMEOUT_MS
-#define RELAY_CONNECT_TIMEOUT_MS 20000u
-#endif
+#define PAGE 24
+#define ID_LEN 21
+#define NAME_LEN 81
+#define INPUT_LEN 121
+#define CHAT_COLS 28
+#define CHAT_ROWS 25
+#define CHAT_X 90
+#define ROWS 96
+#define TOKEN_LEN 44
+#define FRAME_LEN 4096
+#define COL_BG 16
+#define COL_FG 17
+#define COL_PANEL 18
+#define COL_PURPLE 19
+#define COL_MUTED 20
+#define COL_ERROR 21
 
-/* ---------------------------------------------------------------------- */
-/* Layout constants                                                        */
-/* ---------------------------------------------------------------------- */
-
-#define FONT_W       8
-#define FONT_H       8
-#define LCD_W        320
-#define LCD_H        240
-
-/* Sidebar */
-#define SIDEBAR_W    64          /* pixels */
-#define SIDEBAR_X    0
-#define DIVIDER_X    64
-#define DIVIDER_W    2
-
-/* Chat area */
-#define CHAT_X       (DIVIDER_X + DIVIDER_W)  /* 66 */
-#define CHAT_W       (LCD_W - CHAT_X)         /* 254 */
-#define CHAT_COLS    (CHAT_W / FONT_W)         /* 31 chars */
-
-/* Vertical regions */
-#define TITLE_Y      0
-#define TITLE_H      FONT_H                   /* 8 */
-#define CONTENT_Y    (TITLE_Y + TITLE_H)      /* 8 */
-#define CONTENT_H    (LCD_H - CONTENT_Y)      /* 232 */
-#define INPUT_ROWS   2
-#define INPUT_H      (INPUT_ROWS * FONT_H)    /* 16 */
-#define INPUT_Y      (LCD_H - INPUT_H)        /* 224 */
-#define TRANS_Y      CONTENT_Y                /* 8 */
-#define TRANS_H      (INPUT_Y - TRANS_Y)      /* 216 */
-#define TRANS_ROWS   (TRANS_H / FONT_H)       /* 27 */
-
-/* Sidebar rows */
-#define SIDEBAR_ROWS ((LCD_H - CONTENT_Y) / FONT_H) /* 29 */
-
-/* ---------------------------------------------------------------------- */
-/* Colors                                                                  */
-/* ---------------------------------------------------------------------- */
-
-#define COL_BG       0xFF   /* white */
-#define COL_FG       0x00   /* black */
-#define COL_SIDEBAR  0xE0   /* light blue-ish (gfx palette index) */
-#define COL_DIVIDER  0x00   /* black */
-#define COL_TITLE_BG 0x10   /* blue */
-#define COL_TITLE_FG 0xFF   /* white */
-#define COL_SYSTEM   0x10   /* blue */
-#define COL_SENT     0x03   /* green */
-#define COL_RECV     0x00   /* black */
-#define COL_ERROR    0xE0   /* red */
-#define COL_CHAN_SEL 0x10   /* blue: selected channel highlight */
-#define COL_CHAN_FG  0x00   /* black: unselected channel text */
-#define COL_UNREAD   0x03   /* green: channel with unread marker */
-
-/* ---------------------------------------------------------------------- */
-/* Saved configuration                                                     */
-/* ---------------------------------------------------------------------- */
-
-#define CONFIG_APPVAR   "DISCRD"
-#define CONFIG_MAGIC    "DRC2"
-#define CONFIG_VERSION  2u
-
-#define HOST_MAX    128
-#define PORT_MAX    6
-#define USER_MAX    32
-#define PIN_MAX     16
-
-struct saved_config
-{
-    char    magic[4];
-    uint8_t version;
-    char    host[HOST_MAX];
-    char    port[PORT_MAX];
-    char    username[USER_MAX];
-    char    pin[PIN_MAX];
-};
-
-/* ---------------------------------------------------------------------- */
-/* Channel list                                                            */
-/* ---------------------------------------------------------------------- */
-
-#define MAX_CHANNELS 24
-#define CHAN_NAME_MAX 24
-
-typedef struct
-{
-    char name[CHAN_NAME_MAX];   /* without '#' */
-    bool unread;
-} channel_t;
-
-/* ---------------------------------------------------------------------- */
-/* Transcript ring                                                         */
-/* ---------------------------------------------------------------------- */
-
-#define RING_LINES  TRANS_ROWS   /* one backing row per visible line */
-#define RING_ROW    (CHAT_COLS + 1)
-
-typedef struct
-{
-    char    rows[RING_LINES][RING_ROW];
-    uint8_t colors[RING_LINES];
-    uint8_t head;       /* index of most recently pushed row */
-    uint8_t count;      /* how many rows are valid */
-    /* diff cache */
-    char    shown[RING_LINES][RING_ROW];
-    uint8_t shown_valid;
-} ring_t;
-
-/* ---------------------------------------------------------------------- */
-/* Input modes                                                             */
-/* ---------------------------------------------------------------------- */
-
-#define MODE_LOWER   0
-#define MODE_UPPER   1
-#define MODE_NUMERIC 2
-
-#define INPUT_BUF_MAX (CHAT_COLS * INPUT_ROWS + 1)  /* 63 */
-
-/* ---------------------------------------------------------------------- */
-/* Setup fields                                                            */
-/* ---------------------------------------------------------------------- */
-
-typedef enum { SF_HOST=0, SF_PORT, SF_USER, SF_PIN, SF_COUNT } setup_field_t;
-
-/* ---------------------------------------------------------------------- */
-/* App state                                                               */
-/* ---------------------------------------------------------------------- */
-
-#define RX_MAX 4096u
-
-typedef struct
-{
-    /* Config */
-    char host[HOST_MAX];
-    char port[PORT_MAX];
-    char username[USER_MAX];
-    char pin[PIN_MAX];
-
-    /* Setup UI */
-    setup_field_t setup_field;
-    uint8_t setup_input_mode;
-
-    /* Channel list */
-    channel_t channels[MAX_CHANNELS];
-    uint8_t   chan_count;
-    uint8_t   chan_sel;        /* index of currently highlighted channel */
-    uint8_t   chan_active;     /* index of channel we are actually in */
-    char      active_name[CHAN_NAME_MAX]; /* name without '#' */
-
-    /* Transcript */
-    ring_t    ring;
-
-    /* Input */
-    char    input[INPUT_BUF_MAX];
-    uint8_t input_len;
-    uint8_t input_mode;
-    bool    input_upper_once;
-
-    /* Socket */
-    struct lwip_socket sock;
-    bool connected;
-    bool authed;
-    bool done;
-
-    /* RX accumulator */
-    char   rx_buf[RX_MAX];
-    size_t rx_len;
-
-    /* Misc */
-    lwip_error_t last_err;
-    bool         need_full_redraw;
-    bool         need_sidebar_redraw;
-    bool         need_trans_redraw;
-    bool         need_input_redraw;
+typedef enum { CONNECTING, LOGIN, LINK, CONFIRM, GUILDS, CHAT } stage_t;
+typedef struct { char id[ID_LEN], name[NAME_LEN]; bool send, history; } entry_t;
+typedef struct { char text[CHAT_COLS + 1], id[ID_LEN]; uint8_t color; } row_t;
+typedef struct {
+    char magic[4]; uint8_t version;
+    char target[128], username[32], token[TOKEN_LEN];
+} saved_t;
+typedef struct {
+    saved_t saved;
+    struct lwip_socket socket;
+    bool connected, done, created, authed, dirty, picker, busy, history_busy;
+    bool refresh_channels, refresh_history, send_pending, logout_pending;
+    bool can_send, can_history, resuming;
+    stage_t stage;
+    char host[128]; uint16_t port;
+    char guild[ID_LEN], channel[ID_LEN], guild_name[NAME_LEN], channel_name[NAME_LEN];
+    char candidate[ID_LEN], panel[1400], status[80]; unsigned panel_scroll;
+    uint32_t auth_started, auth_seconds, serial, page_offset, next_page, last_ping, last_rx, request_time, refresh_time;
+    char auth_req[16], list_req[16], select_req[16], history_req[16], send_req[16];
+    char selected[ID_LEN], selected_name[NAME_LEN]; bool selected_send, selected_history;
+    entry_t entries[PAGE]; uint8_t count, cursor, top;
+    row_t rows[ROWS]; unsigned row_count, scroll;
+    char seen[32][ID_LEN]; unsigned seen_count, seen_next;
+    char input[INPUT_LEN]; uint8_t input_mode; bool shift;
+    char rx[FRAME_LEN]; size_t rx_len;
 } app_t;
+static app_t *g;
 
-static app_t g;
-
-/* ---------------------------------------------------------------------- */
-/* Config persist                                                          */
-/* ---------------------------------------------------------------------- */
-
-static void config_load(void)
-{
-    uint8_t fh = ti_Open(CONFIG_APPVAR, "r");
-    if (!fh) goto defaults;
-
-    struct saved_config cfg;
-    if (ti_Read(&cfg, sizeof(cfg), 1, fh) != 1)               goto close;
-    if (memcmp(cfg.magic, CONFIG_MAGIC, 4) != 0)              goto close;
-    if (cfg.version != CONFIG_VERSION)                        goto close;
-
-    snprintf(g.host,     sizeof(g.host),     "%s", cfg.host);
-    snprintf(g.port,     sizeof(g.port),     "%s", cfg.port);
-    snprintf(g.username, sizeof(g.username), "%s", cfg.username);
-    snprintf(g.pin,      sizeof(g.pin),      "%s", cfg.pin);
-    ti_Close(fh);
-    return;
-
-close:
-    ti_Close(fh);
-defaults:
-    snprintf(g.host, sizeof(g.host), "%s", RELAY_DEFAULT_HOST);
-    snprintf(g.port, sizeof(g.port), "%s", RELAY_DEFAULT_PORT);
-    g.username[0] = '\0';
-    g.pin[0]      = '\0';
+static void copy(char *dst, size_t cap, const char *src) { snprintf(dst, cap, "%s", src); }
+static void status(const char *fmt, ...) {
+    va_list args; va_start(args, fmt); vsnprintf(g->status, sizeof(g->status), fmt, args); va_end(args); g->dirty = true;
 }
-
-static void config_save(void)
-{
-    struct saved_config cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    memcpy(cfg.magic, CONFIG_MAGIC, 4);
-    cfg.version = CONFIG_VERSION;
-    snprintf(cfg.host,     sizeof(cfg.host),     "%s", g.host);
-    snprintf(cfg.port,     sizeof(cfg.port),     "%s", g.port);
-    snprintf(cfg.username, sizeof(cfg.username), "%s", g.username);
-    snprintf(cfg.pin,      sizeof(cfg.pin),      "%s", g.pin);
-
-    uint8_t fh = ti_Open(CONFIG_APPVAR, "w");
-    if (!fh) return;
-    ti_Write(&cfg, sizeof(cfg), 1, fh);
-    ti_SetArchiveStatus(true, fh);
-    ti_Close(fh);
+static void save(void) {
+    uint8_t file = ti_Open("DISCRD", "w");
+    if (!file) { status("Could not save profile"); return; }
+    if (ti_Write(&g->saved, sizeof(g->saved), 1, file) == 1) ti_SetArchiveStatus(true, file);
+    ti_Close(file);
 }
-
-/* ---------------------------------------------------------------------- */
-/* Transcript ring                                                         */
-/* ---------------------------------------------------------------------- */
-
-static void ring_push(const char *text, uint8_t color)
-{
-    g.ring.head = (uint8_t)((g.ring.head + 1u) % RING_LINES);
-    snprintf(g.ring.rows[g.ring.head], RING_ROW, "%s", text ? text : "");
-    g.ring.colors[g.ring.head] = color;
-    if (g.ring.count < RING_LINES) g.ring.count++;
-}
-
-/* Word-wrap one logical message (prefix + body) into CHAT_COLS rows and
- * push each onto the ring.  Long words are hard-broken. */
-static void ring_push_msg(const char *prefix, const char *text,
-                          size_t text_len, uint8_t color)
-{
-    bool first = true;
-    size_t remain = text_len;
-    const char *src = text;
-
-    while (remain > 0 || first)
-    {
-        char row[RING_ROW];
-        const char *p    = first ? (prefix ? prefix : "") : "";
-        size_t plen      = strlen(p);
-        size_t avail     = plen < CHAT_COLS ? CHAT_COLS - plen : 0;
-        size_t take      = remain > avail ? avail : remain;
-
-        /* try to break at a space */
-        if (take < remain && take > 0)
-        {
-            size_t last_sp = 0;
-            for (size_t i = 0; i < take; i++)
-                if (src[i] == ' ') last_sp = i;
-            if (last_sp > 0) take = last_sp;
-        }
-
-        snprintf(row, sizeof(row), "%s%.*s", p, (int)take, src ? src : "");
-        ring_push(row, color);
-
-        first = false;
-        if (take >= remain) break;
-
-        src    += take;
-        remain -= take;
-        while (remain > 0 && *src == ' ') { src++; remain--; }
-    }
-}
-
-/* ---------------------------------------------------------------------- */
-/* Chat helpers (append to ring + mark redraw)                            */
-/* ---------------------------------------------------------------------- */
-
-static void chat_sys(const char *text)
-{
-    ring_push_msg("* ", text, strlen(text), COL_SYSTEM);
-    g.need_trans_redraw = true;
-}
-
-static void chat_sysf(const char *fmt, ...)
-{
-    char buf[80];
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    chat_sys(buf);
-}
-
-static void chat_msg(const char *author, const char *text)
-{
-    char prefix[USER_MAX + 4];
-    snprintf(prefix, sizeof(prefix), "<%s> ", author);
-    ring_push_msg(prefix, text, strlen(text), COL_RECV);
-    g.need_trans_redraw = true;
-}
-
-static void chat_sent(const char *text)
-{
-    ring_push_msg("> ", text, strlen(text), COL_SENT);
-    g.need_trans_redraw = true;
-}
-
-static void chat_err(const char *text)
-{
-    ring_push_msg("! ", text, strlen(text), COL_ERROR);
-    g.need_trans_redraw = true;
-}
-
-static void chat_errf(const char *fmt, ...)
-{
-    char buf[80];
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    chat_err(buf);
-}
-
-/* ---------------------------------------------------------------------- */
-/* Channel list helpers                                                    */
-/* ---------------------------------------------------------------------- */
-
-static void channels_clear(void)
-{
-    g.chan_count = 0;
-    g.chan_sel   = 0;
-    g.need_sidebar_redraw = true;
-}
-
-static void channel_add(const char *name)
-{
-    if (g.chan_count >= MAX_CHANNELS) return;
-    snprintf(g.channels[g.chan_count].name,
-             sizeof(g.channels[g.chan_count].name), "%s", name);
-    g.channels[g.chan_count].unread = false;
-    g.chan_count++;
-}
-
-/* Parse "RELAY_CHAN #ch1,#ch2,..." and populate channel list. */
-static void parse_chan_list(const char *list)
-{
-    channels_clear();
-    const char *p = list;
-    while (*p)
-    {
-        if (*p == '#') p++;
-        const char *comma = strchr(p, ',');
-        size_t len = comma ? (size_t)(comma - p) : strlen(p);
-        if (len > 0 && g.chan_count < MAX_CHANNELS)
-        {
-            char name[CHAN_NAME_MAX];
-            size_t take = len < sizeof(name) - 1 ? len : sizeof(name) - 1;
-            memcpy(name, p, take);
-            name[take] = '\0';
-            channel_add(name);
-        }
-        if (!comma) break;
-        p = comma + 1;
-    }
-    g.need_sidebar_redraw = true;
-}
-
-/* Find channel index by name (without '#'). Returns MAX_CHANNELS if not found. */
-static uint8_t channel_find(const char *name)
-{
-    for (uint8_t i = 0; i < g.chan_count; i++)
-        if (strcmp(g.channels[i].name, name) == 0) return i;
-    return MAX_CHANNELS;
-}
-
-/* ---------------------------------------------------------------------- */
-/* Draw primitives                                                         */
-/* ---------------------------------------------------------------------- */
-
-static void draw_fill(int x, int y, int w, int h, uint8_t color)
-{
-    gfx_SetColor(color);
-    gfx_FillRectangle(x, y, w, h);
-}
-
-static void draw_text(int x, int y, uint8_t fg, uint8_t bg, const char *text)
-{
-    gfx_SetTextFGColor(fg);
-    gfx_SetTextBGColor(bg);
-    gfx_PrintStringXY(text, x, y);
-}
-
-/* Erase a full-width area of the chat column at given y, h pixels. */
-static void erase_chat_row(int y)
-{
-    draw_fill(CHAT_X, y, CHAT_W, FONT_H, COL_BG);
-}
-
-/* ---------------------------------------------------------------------- */
-/* Title bar                                                               */
-/* ---------------------------------------------------------------------- */
-
-static void draw_title(void)
-{
-    /* Sidebar label */
-    draw_fill(SIDEBAR_X, TITLE_Y, SIDEBAR_W, TITLE_H, COL_TITLE_BG);
-    draw_text(SIDEBAR_X + 2, TITLE_Y, COL_TITLE_FG, COL_TITLE_BG, "Channels");
-
-    /* Divider header */
-    draw_fill(DIVIDER_X, TITLE_Y, DIVIDER_W, LCD_H, COL_DIVIDER);
-
-    /* Chat title: "#channel | username" */
-    draw_fill(CHAT_X, TITLE_Y, CHAT_W, TITLE_H, COL_TITLE_BG);
-    char title[CHAT_COLS + 1];
-    if (g.active_name[0])
-        snprintf(title, sizeof(title), "#%s | %s", g.active_name, g.username);
-    else
-        snprintf(title, sizeof(title), "Discord | %s", g.username);
-    draw_text(CHAT_X + 2, TITLE_Y, COL_TITLE_FG, COL_TITLE_BG, title);
-}
-
-/* ---------------------------------------------------------------------- */
-/* Sidebar                                                                 */
-/* ---------------------------------------------------------------------- */
-
-static void draw_sidebar(void)
-{
-    /* Clear sidebar content area */
-    draw_fill(SIDEBAR_X, CONTENT_Y, SIDEBAR_W, CONTENT_H, COL_BG);
-
-    for (uint8_t i = 0; i < g.chan_count && i < SIDEBAR_ROWS; i++)
-    {
-        int y = CONTENT_Y + i * FONT_H;
-        bool selected = (i == g.chan_sel);
-        bool active   = (i == g.chan_active);
-
-        uint8_t bg = selected ? COL_CHAN_SEL : COL_BG;
-        uint8_t fg = g.channels[i].unread ? COL_UNREAD : COL_CHAN_FG;
-        if (selected) fg = COL_TITLE_FG;
-
-        draw_fill(SIDEBAR_X, y, SIDEBAR_W, FONT_H, bg);
-
-        /* "#name" truncated to 7 chars (64px / 8px - 1 for '#') */
-        char label[9];
-        snprintf(label, sizeof(label), "#%.7s", g.channels[i].name);
-        draw_text(SIDEBAR_X + 2, y, fg, bg, label);
-
-        /* Active channel marker: '*' on right edge */
-        if (active)
-        {
-            gfx_SetTextFGColor(COL_SENT);
-            gfx_SetTextBGColor(bg);
-            gfx_PrintStringXY("*", SIDEBAR_X + SIDEBAR_W - FONT_W - 2, y);
-        }
-    }
-    g.need_sidebar_redraw = false;
-}
-
-/* ---------------------------------------------------------------------- */
-/* Transcript                                                              */
-/* ---------------------------------------------------------------------- */
-
-static void draw_transcript_full(void)
-{
-    uint8_t visible = g.ring.count < TRANS_ROWS ? g.ring.count : TRANS_ROWS;
-    uint8_t blank   = (uint8_t)(TRANS_ROWS - visible);
-
-    /* blank rows at top */
-    for (uint8_t i = 0; i < blank; i++)
-    {
-        erase_chat_row(TRANS_Y + i * FONT_H);
-        g.ring.shown[i][0] = '\0';
-    }
-
-    for (uint8_t i = 0; i < visible; i++)
-    {
-        uint8_t ri = (uint8_t)((g.ring.head + RING_LINES - (visible - 1u - i))
-                                % RING_LINES);
-        uint8_t row = (uint8_t)(blank + i);
-        int y = TRANS_Y + row * FONT_H;
-        const char *line = g.ring.rows[ri];
-        uint8_t color = g.ring.colors[ri];
-
-        erase_chat_row(y);
-        gfx_SetTextFGColor(color);
-        gfx_SetTextBGColor(COL_BG);
-        gfx_PrintStringXY(line, CHAT_X + 2, y);
-        snprintf(g.ring.shown[row], RING_ROW, "%s", line);
-    }
-
-    g.ring.shown_valid  = TRANS_ROWS;
-    g.need_trans_redraw = false;
-}
-
-static void draw_transcript_diff(void)
-{
-    uint8_t visible = g.ring.count < TRANS_ROWS ? g.ring.count : TRANS_ROWS;
-    uint8_t blank   = (uint8_t)(TRANS_ROWS - visible);
-
-    for (uint8_t i = 0; i < visible; i++)
-    {
-        uint8_t ri = (uint8_t)((g.ring.head + RING_LINES - (visible - 1u - i))
-                                % RING_LINES);
-        uint8_t row = (uint8_t)(blank + i);
-        int y = TRANS_Y + row * FONT_H;
-        const char *line = g.ring.rows[ri];
-
-        if (row < g.ring.shown_valid &&
-            strcmp(g.ring.shown[row], line) == 0)
-            continue;
-
-        erase_chat_row(y);
-        gfx_SetTextFGColor(g.ring.colors[ri]);
-        gfx_SetTextBGColor(COL_BG);
-        gfx_PrintStringXY(line, CHAT_X + 2, y);
-        snprintf(g.ring.shown[row], RING_ROW, "%s", line);
-    }
-    g.ring.shown_valid  = TRANS_ROWS;
-    g.need_trans_redraw = false;
-}
-
-/* ---------------------------------------------------------------------- */
-/* Input area                                                              */
-/* ---------------------------------------------------------------------- */
-
-static void draw_input(void)
-{
-    /* Erase input rows */
-    draw_fill(CHAT_X, INPUT_Y, CHAT_W, INPUT_H, COL_BG);
-
-    /* Mode indicator char */
-    char prompt[3];
-    switch (g.input_upper_once ? MODE_UPPER : g.input_mode)
-    {
-    case MODE_UPPER:   prompt[0] = 'A'; break;
-    case MODE_NUMERIC: prompt[0] = '0'; break;
-    default:           prompt[0] = 'a'; break;
-    }
-    prompt[1] = ' ';
-    prompt[2] = '\0';
-
-    /* Build display string "a <input>" — truncate to fit two rows */
-    char display[INPUT_BUF_MAX + 3];
-    snprintf(display, sizeof(display), "%s%s", prompt, g.input);
-
-    /* Print up to two rows */
-    size_t total = strlen(display);
-    size_t col1  = total > CHAT_COLS ? CHAT_COLS : total;
-    char row1[CHAT_COLS + 1];
-    snprintf(row1, sizeof(row1), "%.*s", (int)col1, display);
-    gfx_SetTextFGColor(COL_FG);
-    gfx_SetTextBGColor(COL_BG);
-    gfx_PrintStringXY(row1, CHAT_X + 2, INPUT_Y);
-
-    if (total > CHAT_COLS)
-    {
-        char row2[CHAT_COLS + 1];
-        snprintf(row2, sizeof(row2), "%.*s", (int)CHAT_COLS,
-                 display + CHAT_COLS);
-        gfx_PrintStringXY(row2, CHAT_X + 2, INPUT_Y + FONT_H);
-    }
-
-    g.need_input_redraw = false;
-}
-
-/* ---------------------------------------------------------------------- */
-/* Full screen redraw                                                      */
-/* ---------------------------------------------------------------------- */
-
-static void draw_all(void)
-{
-    gfx_SetColor(COL_BG);
-    gfx_FillScreen(COL_BG);
-
-    draw_title();
-    draw_sidebar();
-    draw_transcript_full();
-    draw_input();
-    gfx_BlitBuffer();
-
-    g.need_full_redraw    = false;
-    g.need_sidebar_redraw = false;
-    g.need_trans_redraw   = false;
-    g.need_input_redraw   = false;
-}
-
-/* Incremental update — only repaint what's dirty. */
-static void draw_update(void)
-{
-    if (g.need_full_redraw) { draw_all(); return; }
-    if (g.need_sidebar_redraw) draw_sidebar();
-    if (g.need_trans_redraw)   draw_transcript_diff();
-    if (g.need_input_redraw)   draw_input();
-    gfx_BlitBuffer();
-}
-
-/* ---------------------------------------------------------------------- */
-/* RX: parse lines from the relay                                          */
-/* ---------------------------------------------------------------------- */
-
-static void relay_handle_line(const char *line)
-{
-    if (strcmp(line, "OK") == 0)
-    {
-        g.authed = true;
-        chat_sysf("authed as %s", g.username);
-        return;
-    }
-
-    if (strcmp(line, "DENIED") == 0)
-    {
-        chat_err("auth denied");
-        g.done = true;
-        return;
-    }
-
-    if (strncmp(line, "RELAY_CHAN ", 11) == 0)
-    {
-        parse_chan_list(line + 11);
-        return;
-    }
-
-    if (strncmp(line, "RELAY_ACTIVE ", 13) == 0)
-    {
-        const char *name = line + 13;
-        if (*name == '#') name++;
-        snprintf(g.active_name, sizeof(g.active_name), "%s", name);
-
-        uint8_t idx = channel_find(name);
-        if (idx < g.chan_count)
-        {
-            g.chan_active = idx;
-            g.chan_sel    = idx;
-            g.channels[idx].unread = false;
-        }
-        draw_title();
-        g.need_sidebar_redraw = true;
-        return;
-    }
-
-    if (strncmp(line, "MSG ", 4) == 0)
-    {
-        const char *rest = line + 4;
-        const char *sep  = strchr(rest, ':');
-        if (sep && sep > rest && sep[1] == ' ')
-        {
-            char author[USER_MAX + 1];
-            size_t alen = (size_t)(sep - rest);
-            if (alen >= sizeof(author)) alen = sizeof(author) - 1;
-            memcpy(author, rest, alen);
-            author[alen] = '\0';
-            chat_msg(author, sep + 2);
-        }
-        else
-        {
-            chat_msg("?", rest);
-        }
-        return;
-    }
-
-    if (strncmp(line, "SYS ", 4) == 0)
-    {
-        chat_sys(line + 4);
-        return;
-    }
-}
-
-static void relay_on_readable(void)
-{
-    uint8_t tmp[128];
-    while (lwip_socket_available(&g.sock))
-    {
-        size_t got = lwip_socket_read(&g.sock, tmp, sizeof(tmp));
-        for (size_t i = 0; i < got; i++)
-        {
-            char c = (char)tmp[i];
-            if (c == '\n')
-            {
-                if (g.rx_len > 0 && g.rx_buf[g.rx_len - 1] == '\r')
-                    g.rx_len--;
-                g.rx_buf[g.rx_len] = '\0';
-                relay_handle_line(g.rx_buf);
-                g.rx_len = 0;
-            }
-            else if (g.rx_len + 1 < RX_MAX)
-            {
-                g.rx_buf[g.rx_len++] = c;
-            }
-        }
-    }
-}
-
-/* ---------------------------------------------------------------------- */
-/* Socket TX helpers                                                       */
-/* ---------------------------------------------------------------------- */
-
-static void relay_writef(const char *fmt, ...)
-{
-    char buf[256];
-    va_list ap; va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n > 0 && (size_t)n < sizeof(buf))
-        lwip_socket_write(&g.sock, (const uint8_t *)buf, (size_t)n);
-}
-
-static void relay_send_auth(void)
-{
-    relay_writef("AUTH %s %s\n", g.username, g.pin);
-}
-
-static void relay_send_text(const char *text)
-{
-    relay_writef("SEND %s\n", text);
-}
-
-static void relay_switch_chan(const char *name)
-{
-    relay_writef("CHAN #%s\n", name);
-}
-
-/* ---------------------------------------------------------------------- */
-/* Socket event callback                                                   */
-/* ---------------------------------------------------------------------- */
-
-static void relay_on_event(struct lwip_socket *sock,
-                           lwip_socket_event_type_t type,
-                           const void *ev_data, void *arg)
-{
-    (void)sock; (void)arg;
-    switch (type)
-    {
-    case LWIP_SOCKET_EV_STATE_CHANGE:
-    {
-        const lwip_socket_state_data_t *st = ev_data;
-        if (st->current == LWIP_STATUS_RESOLVING)
-            chat_sys("resolving...");
-        else if (st->current == LWIP_STATUS_CONNECTING)
-            chat_sys("connecting...");
-        else if (st->current == LWIP_STATUS_CONNECTED)
-        {
-            chat_sys("TLS ok");
-            g.connected = true;
-            relay_send_auth();
-        }
-        else if (st->current == LWIP_STATUS_CLOSED ||
-                 st->current == LWIP_STATUS_RESET)
-        {
-            g.done = true;
-        }
-        break;
-    }
-    case LWIP_SOCKET_EV_ERROR:
-    {
-        const lwip_socket_error_data_t *e = ev_data;
-        g.last_err = e->err;
-        g.done     = true;
-        chat_errf("err %d", (int)e->err);
-        break;
-    }
-    case LWIP_SOCKET_EV_IO:
-    {
-        const lwip_socket_io_data_t *io = ev_data;
-        if (io->flags & LWIP_SOCKET_IO_READABLE)
-            relay_on_readable();
-        break;
-    }
-    default: break;
-    }
-}
-
-/* ---------------------------------------------------------------------- */
-/* Input handling                                                          */
-/* ---------------------------------------------------------------------- */
-
-static void input_handle_key(uint8_t key)
-{
-    if (key == sk_Alpha)
-    {
-        g.input_mode       = (uint8_t)((g.input_mode + 1u) % 3u);
-        g.input_upper_once = false;
-        g.need_input_redraw = true;
-        return;
-    }
-    if (key == sk_2nd)
-    {
-        g.input_upper_once  = true;
-        g.need_input_redraw = true;
-        return;
-    }
-    if (key == sk_Del)
-    {
-        if (g.input_len > 0)
-        {
-            g.input[--g.input_len] = '\0';
-            g.need_input_redraw = true;
-        }
-        return;
-    }
-    if (key == sk_Clear)
-    {
-        g.input_len = 0;
-        g.input[0]  = '\0';
-        g.need_input_redraw = true;
-        return;
-    }
-    if (key == sk_Enter)
-    {
-        if (g.input_len == 0 || !g.authed) return;
-        char msg[INPUT_BUF_MAX];
-        size_t mlen = g.input_len;
-        memcpy(msg, g.input, mlen);
-        msg[mlen]   = '\0';
-        g.input_len = 0;
-        g.input[0]  = '\0';
-        g.need_input_redraw = true;
-        relay_send_text(msg);
-        chat_sent(msg);
-        return;
-    }
-    /* Up/Down: navigate channel list */
-    if (key == sk_Up && g.chan_count > 0)
-    {
-        g.chan_sel = (uint8_t)((g.chan_sel + g.chan_count - 1u) % g.chan_count);
-        g.need_sidebar_redraw = true;
-        return;
-    }
-    if (key == sk_Down && g.chan_count > 0)
-    {
-        g.chan_sel = (uint8_t)((g.chan_sel + 1u) % g.chan_count);
-        g.need_sidebar_redraw = true;
-        return;
-    }
-    /* Right: switch to highlighted channel */
-    if (key == sk_Right && g.chan_count > 0 && g.chan_sel != g.chan_active)
-    {
-        /* Clear transcript for the new channel */
-        memset(&g.ring, 0, sizeof(g.ring));
-        g.need_full_redraw = true;
-        relay_switch_chan(g.channels[g.chan_sel].name);
-        return;
-    }
-
-    /* Printable character */
-    uint8_t mode = g.input_upper_once ? MODE_UPPER : g.input_mode;
-    char c = key_to_char(key, mode);
-    if (c && g.input_len + 1 < INPUT_BUF_MAX)
-    {
-        g.input[g.input_len++] = c;
-        g.input[g.input_len]   = '\0';
-        if (g.input_upper_once) g.input_upper_once = false;
-        g.need_input_redraw = true;
-    }
-}
-
-/* ---------------------------------------------------------------------- */
-/* Setup screen                                                            */
-/* ---------------------------------------------------------------------- */
-
-/* Print a text field row in setup context using lwip_example_line* */
-static void setup_field_row(bool active, const char *label,
-                            const char *value, bool hidden, const char *hint)
-{
-    if (active)
-        lwip_example_linef("> %s  (%s)", label, hint);
-    else
-        lwip_example_linef("  %s", label);
-
-    if (hidden)
-    {
-        size_t n = strlen(value);
-        char stars[PIN_MAX + 1];
-        if (n >= sizeof(stars)) n = sizeof(stars) - 1;
-        memset(stars, '*', n);
-        stars[n] = '\0';
-        lwip_example_line_wrapped(stars);
-    }
-    else
-    {
-        lwip_example_line_wrapped(value);
-    }
-    lwip_example_line("");
-}
-
-static void setup_render(void)
-{
-    const char *hint;
-    switch (g.setup_input_mode)
-    {
-    case MODE_UPPER:   hint = "ABC"; break;
-    case MODE_NUMERIC: hint = "123"; break;
-    default:           hint = "abc"; break;
-    }
-
-    lwip_example_clear();
-    lwip_example_line("=== Discord Relay ===");
-    lwip_example_line("");
-    setup_field_row(g.setup_field == SF_HOST, "relay host:", g.host,
-                    false, hint);
-    setup_field_row(g.setup_field == SF_PORT, "port:", g.port,
-                    false, "123");
-    setup_field_row(g.setup_field == SF_USER, "username:", g.username,
-                    false, hint);
-    setup_field_row(g.setup_field == SF_PIN, "PIN:", g.pin,
-                    true, "123");
-    lwip_example_line("Enter: next/connect  Clear: exit");
-    lwip_example_draw_mem_stats();
-    lwip_example_present();
-}
-
-static char *setup_active(size_t *cap)
-{
-    switch (g.setup_field)
-    {
-    case SF_PORT: *cap = sizeof(g.port);     return g.port;
-    case SF_USER: *cap = sizeof(g.username); return g.username;
-    case SF_PIN:  *cap = sizeof(g.pin);      return g.pin;
-    default:      *cap = sizeof(g.host);     return g.host;
-    }
-}
-
-static bool setup_append(char c)
-{
-    if (g.setup_field == SF_PORT && !isdigit((unsigned char)c)) return false;
-    if (g.setup_field == SF_PIN  && !isdigit((unsigned char)c)) return false;
-    if (c == ' ' || !c) return false;
-
-    size_t cap;
-    char *buf = setup_active(&cap);
-    size_t len = strlen(buf);
-    if (len + 1 >= cap) return false;
-    buf[len++] = c;
-    buf[len]   = '\0';
+static bool token_valid(const char *s) {
+    if (strlen(s) != 43) return false;
+    for (; *s; ++s) if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
+        (*s >= '0' && *s <= '9') || *s == '_' || *s == '-')) return false;
     return true;
 }
-
-static bool setup_backspace(void)
-{
-    size_t cap;
-    char *buf = setup_active(&cap);
-    (void)cap;
-    size_t len = strlen(buf);
-    if (!len) return false;
-    buf[len - 1] = '\0';
-    return true;
+static void load(void) {
+    memset(&g->saved, 0, sizeof(g->saved));
+    uint8_t file = ti_Open("DISCRD", "r");
+    if (file) {
+        if (ti_Read(&g->saved, sizeof(g->saved), 1, file) != 1 ||
+            memcmp(g->saved.magic, "DSC3", 4) || g->saved.version != 3 ||
+            !memchr(g->saved.target, 0, sizeof(g->saved.target)) ||
+            !memchr(g->saved.username, 0, sizeof(g->saved.username)) ||
+            !memchr(g->saved.token, 0, sizeof(g->saved.token))) memset(&g->saved, 0, sizeof(g->saved));
+        ti_Close(file);
+    }
+    memcpy(g->saved.magic, "DSC3", 4); g->saved.version = 3;
+    if (!g->saved.target[0]) copy(g->saved.target, sizeof(g->saved.target), RELAY_DEFAULT_HOST);
+    if (!g->saved.username[0]) copy(g->saved.username, sizeof(g->saved.username), "DiscordCE");
+    if (!token_valid(g->saved.token)) g->saved.token[0] = 0;
 }
 
-static bool setup_run(void)
-{
-    g.setup_field      = SF_HOST;
-    g.setup_input_mode = MODE_LOWER;
-    bool redraw = true;
+static void clear_chat(void) {
+    g->row_count = g->scroll = g->seen_count = g->seen_next = 0;
+    g->history_busy = g->refresh_history = false; g->history_req[0] = 0;
+    g->input[0] = 0; g->send_pending = false; g->send_req[0] = 0; g->dirty = true;
+}
+static void clear_selection(void) {
+    clear_chat(); g->guild[0] = g->channel[0] = g->candidate[0] = 0;
+    g->count = g->cursor = g->top = 0; g->busy = false;
+    g->list_req[0] = g->select_req[0] = 0;
+    g->can_send = g->can_history = false; g->refresh_channels = false;
+}
+static void fail(const char *message) {
+    g->done = true; g->connected = false; clear_selection(); status("%s", message);
+}
+/* One '?' per non-ASCII codepoint; protocol strings themselves retain UTF-8. */
+static void display_ascii(char *dst, size_t cap, const char *src) {
+    size_t n = 0;
+    while (*src && n + 1 < cap) {
+        unsigned char c = (unsigned char)*src++;
+        if (c < 128) dst[n++] = c >= 32 && c != 127 ? (char)c : ' ';
+        else { dst[n++] = '?'; while (((unsigned char)*src & 0xC0) == 0x80) ++src; }
+    }
+    dst[n] = 0;
+}
+static void add_row(const char *text, const char *id, uint8_t color) {
+    unsigned pos = g->row_count;
+    /* Snowflakes sort by decimal length, then lexically, without 64-bit arithmetic. */
+    for (unsigned i = 0; *id && i < g->row_count; ++i) {
+        const char *other = g->rows[i].id;
+        if (*other && (strlen(other) > strlen(id) || (strlen(other) == strlen(id) && strcmp(other, id) > 0))) { pos = i; break; }
+    }
+    if (g->row_count == ROWS) {
+        if (!pos) return;
+        memmove(g->rows, g->rows + 1, sizeof(row_t) * (ROWS - 1)); --g->row_count; --pos;
+    }
+    memmove(g->rows + pos + 1, g->rows + pos, sizeof(row_t) * (g->row_count - pos));
+    ++g->row_count;
+    row_t *row = &g->rows[pos]; copy(row->text, sizeof(row->text), text);
+    copy(row->id, sizeof(row->id), id); row->color = color;
+}
+static void append(const char *text, const char *id, uint8_t color) {
+    char row[CHAT_COLS + 1]; size_t len = strlen(text);
+    do {
+        size_t n = len < CHAT_COLS ? len : CHAT_COLS;
+        memcpy(row, text, n); row[n] = 0; add_row(row, id, color);
+        text += n; len -= n;
+    } while (len);
+    g->scroll = 0; g->dirty = true;
+}
+static void delete_message(const char *id) {
+    unsigned out = 0;
+    for (unsigned i = 0; i < g->row_count; ++i) if (strcmp(g->rows[i].id, id)) g->rows[out++] = g->rows[i];
+    g->row_count = out; g->scroll = 0; g->dirty = true;
+}
+static bool seen(const char *id) {
+    for (unsigned i = 0; i < g->row_count; ++i) if (!strcmp(g->rows[i].id, id)) return true;
+    for (unsigned i = 0; i < g->seen_count; ++i) if (!strcmp(g->seen[i], id)) return true;
+    copy(g->seen[g->seen_next], ID_LEN, id); g->seen_next = (g->seen_next + 1) % 32;
+    if (g->seen_count < 32) ++g->seen_count; return false;
+}
 
-    while (true)
-    {
+static bool request(char *tracker, const char *op, const char *extra) {
+    char frame[400], id[16];
+    snprintf(id, sizeof(id), "r%lu", (unsigned long)++g->serial);
+    int n = snprintf(frame, sizeof(frame), "{\"op\":\"%s\",\"id\":\"%s\"%s}\n", op, id, extra ? extra : "");
+    if (n < 0 || (size_t)n >= sizeof(frame)) { status("Request too long"); return false; }
+    if (!g->connected || lwip_socket_write(&g->socket, (const uint8_t *)frame, (size_t)n) != LWIP_OK) {
+        fail("Connection lost; send outcome unknown"); return false;
+    }
+    if (tracker) { copy(tracker, 16, id); g->request_time = lwip_now_ms(); }
+    return true;
+}
+static void login(void) {
+    char extra[70]; g->stage = LOGIN; g->resuming = token_valid(g->saved.token);
+    if (g->resuming) {
+        snprintf(extra, sizeof(extra), ",\"token\":\"%s\"", g->saved.token);
+        request(g->auth_req, "resume", extra); status("Resuming saved session...");
+    } else { request(g->auth_req, "login", NULL); status("Requesting browser login..."); }
+}
+static void list_page(uint32_t offset) {
+    char extra[40];
+    if (g->busy) return;
+    snprintf(extra, sizeof(extra), ",\"offset\":%lu", (unsigned long)offset);
+    if (request(g->list_req, g->stage == GUILDS ? "guilds" : "channels", extra)) {
+        g->page_offset = offset; g->next_page = 0; g->busy = true;
+        g->count = g->cursor = g->top = 0; status("Loading list...");
+    }
+}
+static void history(void) {
+    if (g->history_busy || !g->channel[0] || !g->can_history || g->busy) return;
+    if (request(g->history_req, "history", ",\"limit\":20")) {
+        g->row_count = g->scroll = g->seen_count = g->seen_next = 0;
+        g->history_busy = true; g->refresh_history = false; status("Loading history...");
+    }
+}
+static void choose(void) {
+    char extra[60];
+    if (g->busy || !g->count || g->cursor >= g->count) return;
+    entry_t *entry = &g->entries[g->cursor];
+    copy(g->selected, sizeof(g->selected), entry->id); copy(g->selected_name, sizeof(g->selected_name), entry->name);
+    g->selected_send = entry->send; g->selected_history = entry->history;
+    snprintf(extra, sizeof(extra), ",\"%s_id\":\"%s\"", g->stage == GUILDS ? "guild" : "channel", entry->id);
+    if (request(g->select_req, g->stage == GUILDS ? "select_guild" : "select_channel", extra)) {
+        g->busy = true; status("Waiting for selection...");
+    }
+}
+static bool matches(const char *a, const char *b) { return *a && *b && !strcmp(a, b); }
+static void received(char *line) {
+    wire_object object; uint32_t number;
+    if (!wire_parse(&object, line)) { fail("Invalid relay frame"); return; }
+    g->last_rx = lwip_now_ms();
+    const char *type = wire_string(&object, "type"), *id = wire_string(&object, "id");
+    const char *guild = wire_string(&object, "guild_id"), *channel = wire_string(&object, "channel_id");
+    bool auth_response = matches(id, g->auth_req), list_response = matches(id, g->list_req);
+    if (!strcmp(type, "hello")) {
+        if (g->stage != CONNECTING || !wire_uint(&object, "version", &number) || number != 2) { fail("Relay protocol mismatch"); return; }
+        login(); return;
+    }
+    if (!strcmp(type, "device") && auth_response) {
+        const char *uri = wire_string(&object, "verification_uri"), *code = wire_string(&object, "user_code");
+        if (strncmp(uri, "https://", 8) || strlen(uri) > 1024 || strlen(code) > 128 || !*code) { fail("Invalid login response"); return; }
+        snprintf(g->panel, sizeof(g->panel), "Open on phone/computer:\n%s\n\nEnter this code:\n%s\n\nApprove login in browser.\nUp/Down scroll this screen.", uri, code);
+        g->panel_scroll = 0; g->stage = LOGIN; status("Waiting for browser approval");
+        if (wire_uint(&object, "expires_in", &number)) { g->auth_started = lwip_now_ms(); g->auth_seconds = number; }
+    } else if (!strcmp(type, "link_required") && auth_response) {
+        const char *code = wire_string(&object, "code");
+        if (strlen(code) != 16) { fail("Invalid linking code"); return; }
+        snprintf(g->panel, sizeof(g->panel), "Link your Discord account:\n\nIn a server with this bot, run\n/relay_link code:%s\n\nThen confirm the account here.\nOnly use a code from YOUR calc.", code);
+        g->panel_scroll = 0; g->stage = LINK; status("Waiting for Discord link");
+        if (wire_uint(&object, "expires_in", &number)) { g->auth_started = lwip_now_ms(); g->auth_seconds = number; }
+    } else if (!strcmp(type, "link_candidate") && g->stage == LINK) {
+        const char *user_id = wire_string(&object, "discord_id"); char name[NAME_LEN];
+        if (!wire_id(user_id)) { fail("Invalid linked account"); return; }
+        copy(g->candidate, sizeof(g->candidate), user_id); display_ascii(name, sizeof(name), wire_string(&object, "name"));
+        snprintf(g->panel, sizeof(g->panel), "Confirm YOUR Discord account:\n\n%s\nID: %s\n\nENTER: link this account\nCLEAR: cancel and disconnect", name, user_id);
+        g->stage = CONFIRM; g->panel_scroll = 0; status("Check name and account ID");
+    } else if (!strcmp(type, "authenticated") && auth_response) {
+        const char *token = wire_string(&object, "token");
+        if (!token_valid(token) || !wire_id(wire_string(&object, "discord_id"))) { fail("Invalid session response"); return; }
+        copy(g->saved.token, sizeof(g->saved.token), token); save();
+        g->authed = true; g->auth_seconds = 0; g->panel[0] = 0; clear_selection(); g->stage = GUILDS; list_page(0);
+    } else if ((!strcmp(type, "guild") || !strcmp(type, "channel")) && list_response) {
+        bool is_guild = g->stage == GUILDS;
+        const char *entry_id = is_guild ? guild : channel;
+        if ((!is_guild && (!matches(guild, g->guild) || strcmp(type, "channel"))) ||
+            (is_guild && strcmp(type, "guild")) || !wire_id(entry_id) || g->count == PAGE) { fail("Invalid channel list"); return; }
+        entry_t *entry = &g->entries[g->count++]; copy(entry->id, sizeof(entry->id), entry_id);
+        display_ascii(entry->name, sizeof(entry->name), wire_string(&object, "name"));
+        entry->send = wire_bool(&object, "can_send"); entry->history = wire_bool(&object, "can_history");
+        if (matches(entry_id, g->channel)) { g->can_send = entry->send; g->can_history = entry->history; }
+        g->dirty = true;
+    } else if ((!strcmp(type, "guilds_end") || !strcmp(type, "channels_end")) && list_response) {
+        g->next_page = 0;
+        if (wire_uint(&object, "next_offset", &number) && number > g->page_offset && number <= 100000UL) g->next_page = number;
+        g->busy = false; g->list_req[0] = 0;
+        status(!g->count ? "No accessible entries; Y= reload" :
+               (g->picker || g->stage == GUILDS) ? "Up/Down, Enter to select" : "Enter sends; Y= channels");
+    } else if (!strcmp(type, "selected_guild") && matches(id, g->select_req)) {
+        if (!matches(guild, g->selected)) { fail("Server selection mismatch"); return; }
+        clear_chat(); copy(g->guild, sizeof(g->guild), guild); copy(g->guild_name, sizeof(g->guild_name), g->selected_name);
+        g->channel[0] = 0; g->busy = false; g->select_req[0] = 0; g->stage = CHAT; g->picker = true; list_page(0);
+    } else if (!strcmp(type, "selected_channel") && matches(id, g->select_req)) {
+        if (!matches(channel, g->selected) || !matches(guild, g->guild)) { fail("Channel selection mismatch"); return; }
+        clear_chat(); copy(g->channel, sizeof(g->channel), channel); copy(g->channel_name, sizeof(g->channel_name), g->selected_name);
+        g->can_send = g->selected_send; g->can_history = g->selected_history;
+        g->busy = false; g->select_req[0] = 0; g->picker = false;
+        status(g->can_send ? "Enter sends; Y= channels" : "Read-only channel; Y= channels"); history();
+    } else if (!strcmp(type, "history_begin") && matches(id, g->history_req) && matches(channel, g->channel)) {
+        /* Keep live messages received while HTTP history was in flight. */
+        g->dirty = true;
+    } else if (!strcmp(type, "history_end") && matches(id, g->history_req) && matches(channel, g->channel)) {
+        g->history_busy = false; g->history_req[0] = 0; status("Enter sends; Y= channels");
+    } else if (!strcmp(type, "message") && g->authed && matches(guild, g->guild) && matches(channel, g->channel)) {
+        if (*id && !matches(id, g->history_req)) return;
+        const char *message_id = wire_string(&object, "message_id");
+        if (!wire_id(message_id) || seen(message_id)) return;
+        char author[NAME_LEN], text[513], message[620];
+        display_ascii(author, sizeof(author), wire_string(&object, "author")); display_ascii(text, sizeof(text), wire_string(&object, "text"));
+        snprintf(message, sizeof(message), "<%s> %s%s", author, text, wire_bool(&object, "truncated") ? "..." : "");
+        append(message, message_id, COL_FG);
+        if (wire_uint(&object, "attachments", &number) && number) append("[attachment]", message_id, COL_MUTED);
+    } else if ((!strcmp(type, "message_deleted") || !strcmp(type, "message_changed")) &&
+               g->authed && matches(guild, g->guild) && matches(channel, g->channel)) {
+        const char *message_id = wire_string(&object, "message_id");
+        if (!wire_id(message_id)) return;
+        delete_message(message_id); (void)seen(message_id);
+        if (!strcmp(type, "message_changed")) {
+            g->refresh_history = g->can_history; status(g->can_history ? "Message edited; refreshing..." : "Edited message removed");
+        }
+    } else if (!strcmp(type, "sent") && matches(id, g->send_req)) {
+        g->send_pending = false; g->input[0] = 0; g->send_req[0] = 0; status("Sent");
+    } else if (!strcmp(type, "reset") && g->authed) {
+        clear_selection(); g->stage = GUILDS; list_page(0); status("Access changed; select server");
+    } else if (!strcmp(type, "channels_changed") && matches(guild, g->guild)) {
+        g->refresh_channels = true;
+    } else if (!strcmp(type, "logged_out")) {
+        g->saved.token[0] = 0; save(); fail("Logged out");
+    } else if (!strcmp(type, "error")) {
+        const char *code = wire_string(&object, "code");
+        if (auth_response) {
+            g->saved.token[0] = 0; save();
+            if (g->resuming && !strcmp(code, "invalid_session")) { g->resuming = false; login(); return; }
+            fail(code); return;
+        }
+        if (!strcmp(code, "session_expired") || !strcmp(code, "authentication_required")) { g->saved.token[0] = 0; save(); fail("Session expired; reconnect"); return; }
+        if (list_response || matches(id, g->select_req)) { g->busy = false; g->list_req[0] = g->select_req[0] = 0; }
+        if (matches(id, g->history_req)) { g->history_busy = false; g->history_req[0] = 0; }
+        if (matches(id, g->send_req)) { g->send_pending = false; g->send_req[0] = 0; }
+        status("%s", code);
+    }
+}
+
+static void feed(char c) {
+    if (!c) { fail("Invalid NUL in frame"); return; }
+    if (c == '\n') { g->rx[g->rx_len] = 0; received(g->rx); g->rx_len = 0; }
+    else if (g->rx_len < FRAME_LEN - 1) g->rx[g->rx_len++] = c;
+    else fail("Relay frame exceeds 4096 bytes");
+}
+static void event(struct lwip_socket *socket, lwip_socket_event_type_t type, const void *data, void *arg) {
+    (void)socket; (void)arg;
+    if (type == LWIP_SOCKET_EV_ERROR) { fail("Network/TLS error; reconnect"); return; }
+    if (type == LWIP_SOCKET_EV_STATE_CHANGE) {
+        const lwip_socket_state_data_t *state = data;
+        if (state->current == LWIP_STATUS_CONNECTED) { g->connected = true; status("TLS connected; waiting for relay"); }
+        else if (state->current == LWIP_STATUS_CLOSED || state->current == LWIP_STATUS_RESET) fail("Disconnected; reconnect from setup");
+    }
+}
+
+static void text(int x, int y, uint8_t fg, uint8_t bg, const char *value, unsigned cols) {
+    char clipped[41]; if (cols > 40) cols = 40;
+    snprintf(clipped, sizeof(clipped), "%.*s", (int)cols, value);
+    gfx_SetTextFGColor(fg); gfx_SetTextBGColor(bg); gfx_PrintStringXY(clipped, x, y);
+}
+static void fill(int x, int y, int w, int h, uint8_t color) {
+    gfx_SetColor(color); gfx_FillRectangle(x, y, w, h);
+}
+static void panel(void) {
+    /* Preserve URL/code line breaks and offer scrolling rather than truncation. */
+    const char *p = g->panel; unsigned row = 0, shown = 0;
+    while (*p && shown < 23) {
+        char line[40]; unsigned n = 0;
+        while (*p && *p != '\n' && n < 39) line[n++] = *p++;
+        if (*p == '\n') ++p; line[n] = 0;
+        if (row++ >= g->panel_scroll) { text(2, 24 + shown * 8, COL_FG, COL_BG, line, 39); ++shown; }
+    }
+}
+static void render(void) {
+    char line[80]; gfx_FillScreen(COL_BG);
+    fill(0, 0, 320, 16, COL_PURPLE);
+    snprintf(line, sizeof(line), "Discord %.14s | %.16s", g->saved.username, g->guild_name);
+    text(2, 4, COL_FG, COL_PURPLE, line, 39);
+    if (g->done) { text(4, 40, COL_ERROR, COL_BG, g->status, 39); text(4, 64, COL_FG, COL_BG, "Enter: setup     Mode: exit", 39); }
+    else if (g->stage <= CONFIRM) panel();
+    else {
+        fill(0, 16, CHAT_X - 2, 208, COL_PANEL);
+        text(2, 18, COL_FG, COL_PANEL, g->stage == GUILDS ? "Servers" : "Channels", 10);
+        for (unsigned i = g->top, row = 0; i < g->count && row < 22; ++i, ++row) {
+            bool cursor = i == g->cursor && (g->picker || g->stage == GUILDS);
+            uint8_t bg = cursor ? COL_PURPLE : COL_PANEL;
+            fill(0, 28 + row * 8, CHAT_X - 2, 8, bg);
+            snprintf(line, sizeof(line), "%c%.9s", matches(g->entries[i].id, g->channel) ? '*' : ' ', g->entries[i].name);
+            text(0, 28 + row * 8, COL_FG, bg, line, 10);
+        }
+        text(0, 208, COL_MUTED, COL_PANEL, "<> pages", 10);
+        text(CHAT_X, 18, COL_MUTED, COL_BG, g->stage == GUILDS ? "Choose a Discord server" : g->channel_name, CHAT_COLS);
+        unsigned end = g->row_count > g->scroll ? g->row_count - g->scroll : 0;
+        unsigned start = end > CHAT_ROWS - 2 ? end - (CHAT_ROWS - 2) : 0;
+        for (unsigned i = start; i < end; ++i) text(CHAT_X, 30 + (i - start) * 8, g->rows[i].color, COL_BG, g->rows[i].text, CHAT_COLS);
+        if (g->stage == CHAT && !g->picker) {
+            size_t len = strlen(g->input); const char *tail = g->input + (len > CHAT_COLS - 2 ? len - (CHAT_COLS - 2) : 0);
+            snprintf(line, sizeof(line), "%c %s", g->shift || g->input_mode == 1 ? 'A' : g->input_mode == 2 ? '0' : 'a', tail);
+            fill(CHAT_X, 216, 230, 8, COL_PANEL); text(CHAT_X, 216, COL_FG, COL_PANEL, line, CHAT_COLS);
+        }
+    }
+    fill(0, 224, 320, 16, COL_PANEL); text(2, 225, COL_FG, COL_PANEL, g->status, 39);
+    text(2, 233, COL_MUTED, COL_PANEL, "Y=:channels Window:servers Mode:back", 39);
+    gfx_BlitBuffer(); g->dirty = false;
+}
+static void palette(void) {
+    static const uint16_t colors[] = { gfx_RGBTo1555(12, 10, 20), gfx_RGBTo1555(235, 233, 245),
+        gfx_RGBTo1555(28, 23, 43), gfx_RGBTo1555(102, 65, 180), gfx_RGBTo1555(175, 158, 211), gfx_RGBTo1555(255, 105, 120) };
+    gfx_SetPalette(colors, sizeof(colors), COL_BG);
+    gfx_SetMonospaceFont(8); gfx_SetTextScale(1, 1);
+}
+static char input_char(uint8_t key) {
+    if (key == sk_Alpha) { g->input_mode = (g->input_mode + 1) % 3; g->shift = false; g->dirty = true; return 0; }
+    if (key == sk_GraphVar) { g->shift = true; g->dirty = true; return 0; }
+    char c = key_to_char(key, g->shift ? 1 : g->input_mode);
+    if (c) g->shift = false; return c;
+}
+static void handle_key(uint8_t key) {
+    if (!key || g->logout_pending) return;
+    if (key == sk_Mode) { g->done = true; clear_selection(); status("Disconnected"); return; }
+    if (key == sk_Graph && g->authed) {
+        g->saved.token[0] = 0; save(); g->logout_pending = true; request(NULL, "logout", NULL); status("Logging out..."); return;
+    }
+    if (g->stage <= CONFIRM) {
+        if (key == sk_Clear) { fail("Login cancelled"); return; }
+        if (key == sk_Up && g->panel_scroll) --g->panel_scroll;
+        if (key == sk_Down && g->panel_scroll < 40) ++g->panel_scroll;
+        if (g->stage == CONFIRM && key == sk_Enter && g->candidate[0]) {
+            char extra[60]; snprintf(extra, sizeof(extra), ",\"discord_id\":\"%s\"", g->candidate);
+            request(g->auth_req, "link_confirm", extra); g->candidate[0] = 0; status("Confirming account...");
+        }
+        g->dirty = true; return;
+    }
+    if (key == sk_Window && !g->busy && !g->send_pending) {
+        /* Viewing the server picker does not change the active subscription yet. */
+        g->stage = GUILDS; g->picker = true; list_page(0); return;
+    }
+    if (key == sk_Yequ && !g->busy) {
+        if (g->stage == GUILDS && !g->guild[0]) list_page(g->page_offset);
+        else { g->stage = CHAT; g->picker = !g->picker || !g->channel[0]; list_page(0); }
+        g->dirty = true; return;
+    }
+    if (g->stage == GUILDS || g->picker) {
+        if (g->busy) return;
+        if (key == sk_Up && g->cursor) --g->cursor;
+        if (key == sk_Down && g->cursor + 1 < g->count) ++g->cursor;
+        if (key == sk_Left && g->page_offset) list_page(g->page_offset >= PAGE ? g->page_offset - PAGE : 0);
+        if (key == sk_Right && g->next_page) list_page(g->next_page);
+        if (key == sk_Enter) choose();
+        if (key == sk_Clear && g->channel[0]) { g->stage = CHAT; g->picker = false; list_page(0); }
+        if (g->cursor < g->top) g->top = g->cursor;
+        if (g->cursor >= g->top + 22) g->top = g->cursor - 21;
+        g->dirty = true; return;
+    }
+    if (key == sk_Up && g->scroll + CHAT_ROWS - 2 < g->row_count) ++g->scroll;
+    else if (key == sk_Down && g->scroll) --g->scroll;
+    else if (key == sk_Trace) { g->refresh_history = g->can_history; }
+    else if (!g->send_pending) {
+        size_t len = strlen(g->input);
+        if (key == sk_Clear) g->input[0] = 0;
+        else if (key == sk_Del && len) g->input[len - 1] = 0;
+        else if (key == sk_Enter && len) {
+            if (!g->channel[0] || !g->can_send || g->busy) { status("Select a writable channel"); return; }
+            char quoted[INPUT_LEN * 2 + 3], extra[INPUT_LEN * 2 + 20];
+            if (wire_quote(quoted, sizeof(quoted), g->input)) {
+                snprintf(extra, sizeof(extra), ",\"text\":%s", quoted);
+                if (request(g->send_req, "send", extra)) { g->send_pending = true; status("Sending..."); }
+            }
+        } else {
+            char c = input_char(key);
+            if (c && len + 1 < sizeof(g->input)) { g->input[len] = c; g->input[len + 1] = 0; }
+        }
+    }
+    g->dirty = true;
+}
+
+static bool setup(void) {
+    unsigned field = 0; bool redraw = true; char original_target[128], original_user[32];
+    copy(original_target, sizeof(original_target), g->saved.target); copy(original_user, sizeof(original_user), g->saved.username);
+    for (;;) {
+        lwip_service_events(); uint8_t key = os_GetCSC();
+        char *value = field ? g->saved.username : g->saved.target;
+        size_t capacity = field ? sizeof(g->saved.username) : sizeof(g->saved.target), len = strlen(value);
+        if (key == sk_Clear || key == sk_Mode) return false;
+        if (key == sk_Up || key == sk_Down) field = !field;
+        else if (key == sk_Del && len) value[len - 1] = 0;
+        else if (key == sk_Enter) {
+            if (!field) field = 1;
+            else if (!wire_target(g->saved.target, g->host, sizeof(g->host), RELAY_DEFAULT_PORT, &g->port)) status("Use host:port or tls://host:port");
+            else if (!g->saved.username[0]) status("Enter a local username/profile");
+            else {
+                if (strcmp(original_target, g->saved.target) || strcmp(original_user, g->saved.username)) g->saved.token[0] = 0;
+                save(); return true;
+            }
+        } else {
+            char c = input_char(key);
+            if (c && c != ' ' && len + 1 < capacity) { value[len] = c; value[len + 1] = 0; }
+        }
+        if (key) redraw = true;
+        if (redraw) {
+            gfx_FillScreen(COL_BG); fill(0, 0, 320, 16, COL_PURPLE);
+            text(2, 4, COL_FG, COL_PURPLE, "Discord relay setup", 39);
+            text(2, 28, COL_FG, COL_BG, field ? "  Server / IP / URL:" : "> Server / IP / URL:", 39);
+            /* Long targets remain visible on up to four fixed-width lines. */
+            for (unsigned i = 0; i < 4 && i * 39 < strlen(g->saved.target); ++i) text(2, 40 + i * 8, COL_FG, COL_BG, g->saved.target + i * 39, 39);
+            text(2, 86, COL_FG, COL_BG, field ? "> Username (local profile):" : "  Username (local profile):", 39);
+            text(2, 100, COL_FG, COL_BG, g->saved.username, 39);
+            text(2, 124, COL_MUTED, COL_BG, "Discord identity is verified at login.", 39);
+            text(2, 140, COL_MUTED, COL_BG, "Port 8443 unless set in target line.", 39);
+            text(2, 164, COL_FG, COL_BG, "Alpha: abc/ABC/123   X,T: shift", 39);
+            text(2, 180, COL_FG, COL_BG, g->shift ? "Input: ABC (once)" : g->input_mode == 0 ? "Input: abc" : g->input_mode == 1 ? "Input: ABC" : "Input: 123", 39);
+            text(2, 204, COL_ERROR, COL_BG, g->status, 39);
+            text(2, 224, COL_FG, COL_BG, "Enter: next/connect   Clear: exit", 39);
+            gfx_BlitBuffer(); redraw = false;
+        }
+    }
+}
+static void run(void) {
+    g->done = g->connected = g->authed = g->created = g->logout_pending = false;
+    g->panel[0] = 0; g->rx_len = 0; g->auth_seconds = 0; g->stage = CONNECTING;
+    clear_selection(); g->guild_name[0] = g->channel_name[0] = 0;
+    lwip_error_t err = lwip_socket_create(&g->socket, LWIP_SOCKET_ALTCP_TLS, LWIP_NETIF_EXT, NULL, 45000u);
+    if (err != LWIP_OK) { fail("Socket create failed"); return; } g->created = true;
+    lwip_socket_on_event(&g->socket, LWIP_SOCKET_EVENTF_ALL, event, NULL);
+    /* The socket requests DHCP; explicitly request DNS and SNTP too. */
+    err = lwip_netif_request_services(g->socket.netif, LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS | LWIP_SOCKET_SVC_SNTP, 45000u, NULL, NULL);
+    if (err != LWIP_OK) { fail("Network service request failed"); return; }
+    status("Connecting to %.45s:%u", g->host, (unsigned)g->port); render();
+    err = lwip_socket_connect(&g->socket, g->host, g->port);
+    if (err != LWIP_OK) { fail("Connection failed"); return; }
+    g->last_ping = g->last_rx = g->request_time = lwip_now_ms();
+    while (!g->done) {
         lwip_service_events();
-        uint8_t key = os_GetCSC();
-        if (lwip_example_mem_stats_tick(key)) redraw = true;
-
-        if (key == sk_Clear) return false;
-
-        if (key == sk_Alpha)
-        {
-            if (g.setup_field != SF_PORT && g.setup_field != SF_PIN)
-            {
-                g.setup_input_mode = (uint8_t)((g.setup_input_mode + 1u) % 3u);
-                redraw = true;
-            }
+        uint8_t bytes[128]; unsigned budget = FRAME_LEN * 2;
+        while (!g->done && g->connected && lwip_socket_available(&g->socket) && budget) {
+            size_t n = lwip_socket_read(&g->socket, bytes, sizeof(bytes)); if (!n) break;
+            for (size_t i = 0; i < n && !g->done; ++i) feed((char)bytes[i]);
+            budget = budget > n ? budget - n : 0;
         }
-        else if (key == sk_Up)
-        {
-            g.setup_field = (setup_field_t)
-                ((g.setup_field + SF_COUNT - 1u) % SF_COUNT);
-            redraw = true;
+        handle_key(os_GetCSC());
+        uint32_t now = lwip_now_ms();
+        if (g->connected && !g->done && (uint32_t)(now - g->last_ping) >= 30000UL) { request(NULL, "ping", NULL); g->last_ping = now; }
+        if (g->connected && (uint32_t)(now - g->last_rx) >= 90000UL) fail("Relay not responding; reconnect");
+        if (g->authed && (g->busy || g->history_busy || g->send_pending) && (uint32_t)(now - g->request_time) >= 60000UL)
+            fail(g->send_pending ? "No send reply; outcome unknown" : "Request timed out; reconnect");
+        if (g->logout_pending && (uint32_t)(now - g->last_rx) >= 5000UL) fail("Logged out locally; connection closed");
+        if (g->auth_seconds && (uint32_t)(now - g->auth_started) / 1000 >= g->auth_seconds) fail("Login expired; reconnect");
+        if (g->authed && !g->busy && !g->done && (uint32_t)(now - g->refresh_time) >= 1500) {
+            if (g->refresh_channels && g->stage == CHAT) { g->refresh_channels = false; list_page(g->page_offset); g->refresh_time = now; }
+            else if (g->refresh_history && !g->history_busy) { history(); g->refresh_time = now; }
         }
-        else if (key == sk_Down)
-        {
-            g.setup_field = (setup_field_t)((g.setup_field + 1u) % SF_COUNT);
-            redraw = true;
-        }
-        else if (key == sk_Del)
-        {
-            redraw = setup_backspace() || redraw;
-        }
-        else if (key == sk_Enter)
-        {
-            if (g.setup_field < SF_PIN)
-            {
-                g.setup_field = (setup_field_t)(g.setup_field + 1);
-                redraw = true;
-            }
-            else
-            {
-                if (!g.host[0])
-                    snprintf(g.host, sizeof(g.host), "%s", RELAY_DEFAULT_HOST);
-                if (!g.port[0])
-                    snprintf(g.port, sizeof(g.port), "%s", RELAY_DEFAULT_PORT);
-                if (g.host[0] && g.username[0] && g.pin[0])
-                    return true;
-                redraw = true;
-            }
-        }
-        else
-        {
-            uint8_t mode = g.setup_input_mode;
-            char c = key_to_char(key, mode);
-            redraw = setup_append(c) || redraw;
-        }
-
-        if (redraw) { setup_render(); redraw = false; }
+        if (g->dirty) render();
     }
 }
-
-/* ---------------------------------------------------------------------- */
-/* Connection                                                              */
-/* ---------------------------------------------------------------------- */
-
-static bool relay_connect(void)
-{
-    uint16_t port = (uint16_t)atoi(g.port);
-    if (!port) port = 8443;
-
-    memset(&g.sock, 0, sizeof(g.sock));
-    lwip_error_t e = lwip_socket_create(&g.sock, LWIP_SOCKET_ALTCP_TLS,
-                                        LWIP_NETIF_EXT, NULL,
-                                        RELAY_CONNECT_TIMEOUT_MS);
-    if (e != LWIP_OK) { chat_errf("create:%d", (int)e); return false; }
-
-    lwip_socket_on_event(&g.sock, LWIP_SOCKET_EVENTF_ALL,
-                         relay_on_event, NULL);
-
-    e = lwip_socket_connect(&g.sock, g.host, port);
-    if (e != LWIP_OK)
-    {
-        chat_errf("connect:%d", (int)e);
-        lwip_socket_destroy(&g.sock);
-        return false;
+int main(void) {
+    if (!lwip_example_stack_start()) { lwip_example_gfx_stop(); return 1; }
+    g = mem_request(sizeof(*g));
+    if (!g) { lwip_example_show_and_wait("Discord", "Not enough memory"); return lwip_example_finish(1); }
+    memset(g, 0, sizeof(*g)); palette(); load();
+    while (setup()) {
+        run();
+        if (g->created) { lwip_socket_destroy(&g->socket); g->created = false; }
+        clear_selection(); g->done = true; render();
+        uint8_t key = 0;
+        while (key != sk_Enter && key != sk_Mode && key != sk_Clear) { lwip_service_events(); key = os_GetCSC(); }
+        if (key != sk_Enter) break;
+        g->status[0] = 0;
     }
-    return true;
-}
-
-static void relay_disconnect(void)
-{
-    if (lwip_socket_is_active(&g.sock))
-    {
-        lwip_socket_close(&g.sock);
-        uint32_t t = lwip_now_ms() + 3000u;
-        while (lwip_socket_is_active(&g.sock) && lwip_now_ms() < t)
-            lwip_service_events();
-    }
-    lwip_socket_destroy(&g.sock);
-}
-
-/* ---------------------------------------------------------------------- */
-/* Main chat loop                                                          */
-/* ---------------------------------------------------------------------- */
-
-static void relay_run(void)
-{
-    /* Initial draw */
-    draw_all();
-
-    while (!g.done)
-    {
-        lwip_service_events();
-
-        uint8_t key = os_GetCSC();
-        if (key == sk_Mode) { chat_sys("quit"); break; }
-
-        if (key == sk_Stat)
-        {
-            lwip_example_mem_stats_tick(sk_Stat);
-            g.need_full_redraw = true;
-        }
-        else if (key)
-        {
-            input_handle_key(key);
-        }
-
-        /* Redraw anything dirty */
-        if (g.need_full_redraw || g.need_sidebar_redraw ||
-            g.need_trans_redraw || g.need_input_redraw)
-        {
-            draw_update();
-        }
-    }
-}
-
-/* ---------------------------------------------------------------------- */
-/* main                                                                    */
-/* ---------------------------------------------------------------------- */
-
-int main(void)
-{
-    lwip_example_gfx_start();
-    lwip_example_show("Discord Relay", NULL);
-
-    if (!lwip_start())
-    {
-        lwip_example_show_and_wait("lwIP failed", NULL);
-        lwip_example_gfx_stop();
-        return 0;
-    }
-    lwip_example_gfx_blit_start();
-
-    /* Wait for DHCP + DNS */
-    {
-        uint8_t flags = LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS;
-        uint32_t t = lwip_now_ms() + 20000u;
-        while (!lwip_are_services_ready(NULL, flags) && lwip_now_ms() < t)
-            lwip_service_events();
-        if (!lwip_are_services_ready(NULL, flags))
-        {
-            lwip_example_show_and_wait("net timeout", NULL);
-            goto done;
-        }
-    }
-
-    config_load();
-    if (!setup_run()) goto done;
-    config_save();
-
-    /* Switch to custom layout — clear to bg color */
-    gfx_SetColor(COL_BG);
-    gfx_FillScreen(COL_BG);
-    gfx_SetTextBGColor(COL_BG);
-    gfx_SetTextTransparentColor(COL_BG);
-    g.need_full_redraw = true;
-
-    chat_sysf("connecting %s:%s...", g.host, g.port);
-
-    if (!relay_connect())
-    {
-        draw_update();
-        lwip_example_wait_key();
-        goto done;
-    }
-
-    relay_run();
-    relay_disconnect();
-
-    if (g.last_err)
-        chat_errf("closed (err %d)", (int)g.last_err);
-    else
-        chat_sys("disconnected");
-
-    draw_update();
-    lwip_example_wait_key();
-
-done:
-    lwip_stop();
-    lwip_example_gfx_stop();
-    return 0;
+    /* Tokens are saved on authentication, not on exit after an edited profile. */
+    memset(g, 0, sizeof(*g)); mem_release(g); g = NULL;
+    return lwip_example_finish(0);
 }

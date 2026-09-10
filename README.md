@@ -16,6 +16,8 @@ relay/ => Bot code
 For host-specific bot configuration, see [relay setup](relay/README.md) and
 copy [the example configuration](relay/config.json.example) to `relay/config.json`.
 
+For calculator setup, controls, building, and testing, see [the client guide](CLIENT.md).
+
 *Code mostly written by Claude Sonnet so, a review for correctness/efficiency is in order.*
 
 ## Intended design
@@ -72,10 +74,10 @@ Live deployment still needs client registration details and confirmation of OIDC
 
 | Component | Current implementation |
 | --- | --- |
-| `src/main.c` | Channel sidebar and chat pane; light theme; saved username/PIN authentication; TLS line protocol. |
+| `src/main.c` | Purple/black channel/chat UI; IRC-style target/profile setup; device login and account confirmation; protocol v2 over TLS. |
 | `relay/relay.py` | OIDC device login, confirmed Discord account links, expiring sessions, history/live chat, and bot sends using protocol v2. |
 | Channel selection | Mutual-server selection, stable channel IDs, user/bot permission checks, one active connection/server per Discord user. |
 | TLS | Relay requires TLS 1.3; compatibility with Alessio's profile and the calculator needs verification. |
-| Build | CE toolchain; calculator source also depends on lwIP headers and `../../common/lwip_example.h` outside this repository. |
+| Build | CE toolchain and installed lwIP headers/library; `LWIP_CE` selects the checkout containing the shared example helper. Produces `bin/DISC.8xp`. |
 
-The relay has automated tests with simulated Discord/provider responses; live integration and calculator TLS compatibility remain unverified. Its [version 2 protocol](relay/PROTOCOL.md) intentionally replaces username/PIN login. `src/main.c` still speaks the old protocol and must be updated with device login, account confirmation, server selection, and the purple/black theme. The old PIN user file is no longer used by the relay.
+The client and relay implement [protocol v2](relay/PROTOCOL.md), replacing username/PIN login. Client state-machine tests run on the host with sanitizers; relay tests use simulated Discord/provider responses and localhost TLS. Hardware and live OIDC integration remain unverified. The inspected lwIP checkout also has a [certificate trust limitation](CLIENT.md#tls-dependency-status) to resolve before production credentials are used.

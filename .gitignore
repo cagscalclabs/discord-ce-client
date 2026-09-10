@@ -61,6 +61,5 @@ dkms.conf
 /relay/*.sqlite3*
 __pycache__/
 .venv/
-
-
-relay/config.json
+/bin/
+/obj/
