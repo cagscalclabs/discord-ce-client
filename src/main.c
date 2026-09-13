@@ -20,7 +20,7 @@
 #define RELAY_DEFAULT_HOST ""
 #endif
 #ifndef RELAY_DEFAULT_PORT
-#define RELAY_DEFAULT_PORT 8443
+#define RELAY_DEFAULT_PORT 9443
 #endif
 #if RELAY_DEFAULT_PORT < 1 || RELAY_DEFAULT_PORT > 65535
 #error RELAY_DEFAULT_PORT must be between 1 and 65535
@@ -35,7 +35,10 @@
 #define CHAT_X 90
 #define ROWS 96
 #define TOKEN_LEN 44
+#define TOKEN_ENTRY_MAX 32
 #define FRAME_LEN 4096
+#define TRACE_MAX 4
+#define TRACE_LINE_LEN 72
 #define COL_BG 16
 #define COL_FG 17
 #define COL_PANEL 18
@@ -46,21 +49,26 @@
 typedef enum { CONNECTING, LOGIN, LINK, CONFIRM, GUILDS, CHAT } stage_t;
 typedef struct { char id[ID_LEN], name[NAME_LEN]; bool send, history; } entry_t;
 typedef struct { char text[CHAT_COLS + 1], id[ID_LEN]; uint8_t color; } row_t;
+typedef struct { char target[128]; char token[TOKEN_LEN]; } token_entry_t;
 typedef struct {
     char magic[4]; uint8_t version;
-    char target[128], username[32], token[TOKEN_LEN];
+    char target[128], username[32];
+    char token[TOKEN_LEN]; /* runtime only — loaded from token store by target */
 } saved_t;
 typedef struct {
     saved_t saved;
     struct lwip_socket socket;
-    bool connected, done, created, authed, dirty, picker, busy, history_busy;
-    bool refresh_channels, refresh_history, send_pending, logout_pending;
+    bool connected, done, quit, created, authed, dirty, picker, busy, history_busy, network_wait;
+    bool refresh_channels, refresh_history, send_pending, logout_pending, save_pending, initial_guilds_pending;
     bool can_send, can_history, resuming;
     stage_t stage;
     char host[128]; uint16_t port;
     char guild[ID_LEN], channel[ID_LEN], guild_name[NAME_LEN], channel_name[NAME_LEN];
     char candidate[ID_LEN], panel[1400], status[80]; unsigned panel_scroll;
-    uint32_t auth_started, auth_seconds, serial, page_offset, next_page, last_ping, last_rx, request_time, refresh_time;
+    char stack_error[80], tls_step[80], failure_phase[40];
+    char traceback[TRACE_MAX][TRACE_LINE_LEN];
+    uint8_t traceback_count, traceback_scroll;
+    uint32_t auth_started, auth_seconds, serial, page_offset, next_page, last_ping, last_rx, request_time, refresh_time, network_started;
     char auth_req[16], list_req[16], select_req[16], history_req[16], send_req[16];
     char selected[ID_LEN], selected_name[NAME_LEN]; bool selected_send, selected_history;
     entry_t entries[PAGE]; uint8_t count, cursor, top;
@@ -75,10 +83,73 @@ static void copy(char *dst, size_t cap, const char *src) { snprintf(dst, cap, "%
 static void status(const char *fmt, ...) {
     va_list args; va_start(args, fmt); vsnprintf(g->status, sizeof(g->status), fmt, args); va_end(args); g->dirty = true;
 }
+/* Profile AppVar (DISCRD): magic[4] + version(1) + username[32]. */
 static void save(void) {
-    uint8_t file = ti_Open("DISCRD", "w");
+    uint8_t file = ti_Open("DISCRD", "r+");
+    if (!file) file = ti_Open("DISCRD", "w");
     if (!file) { status("Could not save profile"); return; }
-    if (ti_Write(&g->saved, sizeof(g->saved), 1, file) == 1) ti_SetArchiveStatus(true, file);
+    ti_Rewind(file);
+    ti_Write(g->saved.magic, 4, 1, file);
+    ti_Write(&g->saved.version, 1, 1, file);
+    ti_Write(g->saved.username, sizeof(g->saved.username), 1, file);
+    ti_SetArchiveStatus(true, file);
+    ti_Close(file);
+}
+/* Token AppVar (DISCTK): flat array of token_entry_t, one per relay target.
+ * save_token() upserts by target; load_token() looks up by current target. */
+static void save_token(void) {
+    if (!g->saved.token[0] || !g->saved.target[0]) return;
+    token_entry_t e;
+    uint8_t file = ti_Open("DISCTK", "r+");
+    if (!file) {
+        file = ti_Open("DISCTK", "w");
+        if (!file) { status("Token save failed"); return; }
+        uint8_t zero = 0; ti_Write(&zero, 1, 1, file);
+        ti_Close(file);
+        file = ti_Open("DISCTK", "r+");
+        if (!file) { status("Token save failed (r+)"); return; }
+    }
+    uint8_t count = 0;
+    ti_Rewind(file); ti_Read(&count, 1, 1, file);
+    if (count > TOKEN_ENTRY_MAX) count = TOKEN_ENTRY_MAX;
+    /* Scan for existing entry with matching target. */
+    for (uint8_t i = 0; i < count; ++i) {
+        uint16_t pos = ti_Tell(file);
+        if (ti_Read(&e, sizeof(e), 1, file) != 1) break;
+        if (!memchr(e.target, 0, sizeof(e.target)) || !memchr(e.token, 0, sizeof(e.token))) continue;
+        if (!strcmp(e.target, g->saved.target)) {
+            /* Overwrite just the token field in-place. */
+            copy(e.token, sizeof(e.token), g->saved.token);
+            ti_Seek(pos, SEEK_SET, file);
+            ti_Write(&e, sizeof(e), 1, file);
+            ti_SetArchiveStatus(true, file); ti_Close(file); return;
+        }
+    }
+    /* Not found: append if under the cap; evict entry 0 (oldest) if full. */
+    if (count < TOKEN_ENTRY_MAX) {
+        copy(e.target, sizeof(e.target), g->saved.target);
+        copy(e.token, sizeof(e.token), g->saved.token);
+        ti_Write(&e, sizeof(e), 1, file);
+        ++count; ti_Rewind(file); ti_Write(&count, 1, 1, file);
+    }
+    ti_SetArchiveStatus(true, file); ti_Close(file);
+}
+static void load_token(void) {
+    g->saved.token[0] = 0;
+    uint8_t file = ti_Open("DISCTK", "r");
+    if (!file) return;
+    uint8_t count = 0;
+    ti_Read(&count, 1, 1, file);
+    if (count > TOKEN_ENTRY_MAX) count = TOKEN_ENTRY_MAX;
+    for (uint8_t i = 0; i < count; ++i) {
+        token_entry_t e;
+        if (ti_Read(&e, sizeof(e), 1, file) != 1) break;
+        if (!memchr(e.target, 0, sizeof(e.target)) || !memchr(e.token, 0, sizeof(e.token))) continue;
+        if (!strcmp(e.target, g->saved.target)) {
+            copy(g->saved.token, sizeof(g->saved.token), e.token);
+            break;
+        }
+    }
     ti_Close(file);
 }
 static bool token_valid(const char *s) {
@@ -91,16 +162,19 @@ static void load(void) {
     memset(&g->saved, 0, sizeof(g->saved));
     uint8_t file = ti_Open("DISCRD", "r");
     if (file) {
-        if (ti_Read(&g->saved, sizeof(g->saved), 1, file) != 1 ||
-            memcmp(g->saved.magic, "DSC3", 4) || g->saved.version != 3 ||
-            !memchr(g->saved.target, 0, sizeof(g->saved.target)) ||
-            !memchr(g->saved.username, 0, sizeof(g->saved.username)) ||
-            !memchr(g->saved.token, 0, sizeof(g->saved.token))) memset(&g->saved, 0, sizeof(g->saved));
+        char magic[4]; uint8_t version = 0;
+        if (ti_Read(magic, 4, 1, file) == 1 && !memcmp(magic, "DSC4", 4) &&
+            ti_Read(&version, 1, 1, file) == 1 && version == 4 &&
+            ti_Read(g->saved.username, sizeof(g->saved.username), 1, file) == 1 &&
+            memchr(g->saved.username, 0, sizeof(g->saved.username)))
+            memcpy(g->saved.magic, "DSC4", 4), g->saved.version = 4;
+        else memset(&g->saved, 0, sizeof(g->saved));
         ti_Close(file);
     }
-    memcpy(g->saved.magic, "DSC3", 4); g->saved.version = 3;
+    memcpy(g->saved.magic, "DSC4", 4); g->saved.version = 4;
     if (!g->saved.target[0]) copy(g->saved.target, sizeof(g->saved.target), RELAY_DEFAULT_HOST);
     if (!g->saved.username[0]) copy(g->saved.username, sizeof(g->saved.username), "DiscordCE");
+    load_token();
     if (!token_valid(g->saved.token)) g->saved.token[0] = 0;
 }
 
@@ -166,13 +240,29 @@ static bool seen(const char *id) {
 }
 
 static bool request(char *tracker, const char *op, const char *extra) {
-    char frame[400], id[16];
-    snprintf(id, sizeof(id), "r%lu", (unsigned long)++g->serial);
-    int n = snprintf(frame, sizeof(frame), "{\"op\":\"%s\",\"id\":\"%s\"%s}\n", op, id, extra ? extra : "");
-    if (n < 0 || (size_t)n >= sizeof(frame)) { status("Request too long"); return false; }
-    if (!g->connected || lwip_socket_write(&g->socket, (const uint8_t *)frame, (size_t)n) != LWIP_OK) {
-        fail("Connection lost; send outcome unknown"); return false;
+    /* frame[400] on the stack overflows the ez80 stack during deep call chains;
+     * allocate from the lwIP heap instead. */
+    char *frame = mem_malloc(400);
+    if (!frame)
+    {
+        status("Out of memory");
+        return false;
     }
+    char id[16];
+    snprintf(id, sizeof(id), "r%lu", (unsigned long)++g->serial);
+    int n = snprintf(frame, 400, "{\"op\":\"%s\",\"id\":\"%s\"%s}\n", op, id, extra ? extra : "");
+    if (n < 0 || n >= 400)
+    {
+        mem_free(frame);
+        status("Request too long");
+        return false;
+    }
+    if (!g->connected || lwip_socket_write(&g->socket, (const uint8_t *)frame, (size_t)n) != LWIP_OK) {
+        mem_free(frame);
+        fail("Connection lost; send outcome unknown");
+        return false;
+    }
+    mem_free(frame);
     if (tracker) { copy(tracker, 16, id); g->request_time = lwip_now_ms(); }
     return true;
 }
@@ -211,62 +301,78 @@ static void choose(void) {
     }
 }
 static bool matches(const char *a, const char *b) { return *a && *b && !strcmp(a, b); }
+typedef struct {
+    wire_object object;
+    uint32_t number;
+    char name[NAME_LEN];    /* link_candidate display name */
+    char author[NAME_LEN];  /* message author */
+    char text[513];         /* message text */
+    char message[620];      /* formatted message line */
+} rx_buf_t;
 static void received(char *line) {
-    wire_object object; uint32_t number;
-    if (!wire_parse(&object, line)) { fail("Invalid relay frame"); return; }
+    rx_buf_t *r = mem_malloc(sizeof(rx_buf_t));
+    if (!r) { fail("Out of memory"); return; }
+    if (!wire_parse(&r->object, line)) { mem_free(r); fail("Invalid relay frame"); return; }
     g->last_rx = lwip_now_ms();
-    const char *type = wire_string(&object, "type"), *id = wire_string(&object, "id");
-    const char *guild = wire_string(&object, "guild_id"), *channel = wire_string(&object, "channel_id");
+    const char *type = wire_string(&r->object, "type"), *id = wire_string(&r->object, "id");
+    const char *guild = wire_string(&r->object, "guild_id"), *channel = wire_string(&r->object, "channel_id");
     bool auth_response = matches(id, g->auth_req), list_response = matches(id, g->list_req);
     if (!strcmp(type, "hello")) {
-        if (g->stage != CONNECTING || !wire_uint(&object, "version", &number) || number != 2) { fail("Relay protocol mismatch"); return; }
-        login(); return;
+        if (g->stage != CONNECTING || !wire_uint(&r->object, "version", &r->number) || r->number != 2) { mem_free(r); fail("Relay protocol mismatch"); return; }
+        mem_free(r); login(); return;
     }
     if (!strcmp(type, "device") && auth_response) {
-        const char *uri = wire_string(&object, "verification_uri"), *code = wire_string(&object, "user_code");
-        if (strncmp(uri, "https://", 8) || strlen(uri) > 1024 || strlen(code) > 128 || !*code) { fail("Invalid login response"); return; }
+        const char *uri = wire_string(&r->object, "verification_uri"), *code = wire_string(&r->object, "user_code");
+        if (strncmp(uri, "https://", 8) || strlen(uri) > 1024 || strlen(code) > 128 || !*code) { mem_free(r); fail("Invalid login response"); return; }
         snprintf(g->panel, sizeof(g->panel), "Open on phone/computer:\n%s\n\nEnter this code:\n%s\n\nApprove login in browser.\nUp/Down scroll this screen.", uri, code);
         g->panel_scroll = 0; g->stage = LOGIN; status("Waiting for browser approval");
-        if (wire_uint(&object, "expires_in", &number)) { g->auth_started = lwip_now_ms(); g->auth_seconds = number; }
+        if (wire_uint(&r->object, "expires_in", &r->number)) { g->auth_started = lwip_now_ms(); g->auth_seconds = r->number; }
     } else if (!strcmp(type, "link_required") && auth_response) {
-        const char *code = wire_string(&object, "code");
-        if (strlen(code) != 16) { fail("Invalid linking code"); return; }
+        const char *code = wire_string(&r->object, "code");
+        if (strlen(code) != 16) { mem_free(r); fail("Invalid linking code"); return; }
         snprintf(g->panel, sizeof(g->panel), "Link your Discord account:\n\nIn a server with this bot, run\n/relay_link code:%s\n\nThen confirm the account here.\nOnly use a code from YOUR calc.", code);
         g->panel_scroll = 0; g->stage = LINK; status("Waiting for Discord link");
-        if (wire_uint(&object, "expires_in", &number)) { g->auth_started = lwip_now_ms(); g->auth_seconds = number; }
+        if (wire_uint(&r->object, "expires_in", &r->number)) { g->auth_started = lwip_now_ms(); g->auth_seconds = r->number; }
     } else if (!strcmp(type, "link_candidate") && g->stage == LINK) {
-        const char *user_id = wire_string(&object, "discord_id"); char name[NAME_LEN];
-        if (!wire_id(user_id)) { fail("Invalid linked account"); return; }
-        copy(g->candidate, sizeof(g->candidate), user_id); display_ascii(name, sizeof(name), wire_string(&object, "name"));
-        snprintf(g->panel, sizeof(g->panel), "Confirm YOUR Discord account:\n\n%s\nID: %s\n\nENTER: link this account\nCLEAR: cancel and disconnect", name, user_id);
+        const char *user_id = wire_string(&r->object, "discord_id");
+        if (!wire_id(user_id)) { mem_free(r); fail("Invalid linked account"); return; }
+        copy(g->candidate, sizeof(g->candidate), user_id); display_ascii(r->name, sizeof(r->name), wire_string(&r->object, "name"));
+        snprintf(g->panel, sizeof(g->panel), "Confirm YOUR Discord account:\n\n%s\nID: %s\n\nENTER: link this account\nCLEAR: cancel and disconnect", r->name, user_id);
         g->stage = CONFIRM; g->panel_scroll = 0; status("Check name and account ID");
     } else if (!strcmp(type, "authenticated") && auth_response) {
-        const char *token = wire_string(&object, "token");
-        if (!token_valid(token) || !wire_id(wire_string(&object, "discord_id"))) { fail("Invalid session response"); return; }
-        copy(g->saved.token, sizeof(g->saved.token), token); save();
-        g->authed = true; g->auth_seconds = 0; g->panel[0] = 0; clear_selection(); g->stage = GUILDS; list_page(0);
+        const char *token = wire_string(&r->object, "token");
+        if (!token_valid(token) || !wire_id(wire_string(&r->object, "discord_id"))) { mem_free(r); fail("Invalid session response"); return; }
+        copy(g->saved.token, sizeof(g->saved.token), token);
+        save_token(); /* mem_malloc pointers are safe across FileIOC; write immediately */
+        g->authed = true;
+        g->auth_seconds = 0;
+        g->panel[0] = 0;
+        clear_selection();
+        g->stage = GUILDS;
+        g->initial_guilds_pending = true;
+        status("Login confirmed; loading servers...");
     } else if ((!strcmp(type, "guild") || !strcmp(type, "channel")) && list_response) {
         bool is_guild = g->stage == GUILDS;
         const char *entry_id = is_guild ? guild : channel;
         if ((!is_guild && (!matches(guild, g->guild) || strcmp(type, "channel"))) ||
-            (is_guild && strcmp(type, "guild")) || !wire_id(entry_id) || g->count == PAGE) { fail("Invalid channel list"); return; }
+            (is_guild && strcmp(type, "guild")) || !wire_id(entry_id) || g->count == PAGE) { mem_free(r); fail("Invalid channel list"); return; }
         entry_t *entry = &g->entries[g->count++]; copy(entry->id, sizeof(entry->id), entry_id);
-        display_ascii(entry->name, sizeof(entry->name), wire_string(&object, "name"));
-        entry->send = wire_bool(&object, "can_send"); entry->history = wire_bool(&object, "can_history");
+        display_ascii(entry->name, sizeof(entry->name), wire_string(&r->object, "name"));
+        entry->send = wire_bool(&r->object, "can_send"); entry->history = wire_bool(&r->object, "can_history");
         if (matches(entry_id, g->channel)) { g->can_send = entry->send; g->can_history = entry->history; }
         g->dirty = true;
     } else if ((!strcmp(type, "guilds_end") || !strcmp(type, "channels_end")) && list_response) {
         g->next_page = 0;
-        if (wire_uint(&object, "next_offset", &number) && number > g->page_offset && number <= 100000UL) g->next_page = number;
+        if (wire_uint(&r->object, "next_offset", &r->number) && r->number > g->page_offset && r->number <= 100000UL) g->next_page = r->number;
         g->busy = false; g->list_req[0] = 0;
         status(!g->count ? "No accessible entries; Y= reload" :
                (g->picker || g->stage == GUILDS) ? "Up/Down, Enter to select" : "Enter sends; Y= channels");
     } else if (!strcmp(type, "selected_guild") && matches(id, g->select_req)) {
-        if (!matches(guild, g->selected)) { fail("Server selection mismatch"); return; }
+        if (!matches(guild, g->selected)) { mem_free(r); fail("Server selection mismatch"); return; }
         clear_chat(); copy(g->guild, sizeof(g->guild), guild); copy(g->guild_name, sizeof(g->guild_name), g->selected_name);
         g->channel[0] = 0; g->busy = false; g->select_req[0] = 0; g->stage = CHAT; g->picker = true; list_page(0);
     } else if (!strcmp(type, "selected_channel") && matches(id, g->select_req)) {
-        if (!matches(channel, g->selected) || !matches(guild, g->guild)) { fail("Channel selection mismatch"); return; }
+        if (!matches(channel, g->selected) || !matches(guild, g->guild)) { mem_free(r); fail("Channel selection mismatch"); return; }
         clear_chat(); copy(g->channel, sizeof(g->channel), channel); copy(g->channel_name, sizeof(g->channel_name), g->selected_name);
         g->can_send = g->selected_send; g->can_history = g->selected_history;
         g->busy = false; g->select_req[0] = 0; g->picker = false;
@@ -277,18 +383,18 @@ static void received(char *line) {
     } else if (!strcmp(type, "history_end") && matches(id, g->history_req) && matches(channel, g->channel)) {
         g->history_busy = false; g->history_req[0] = 0; status("Enter sends; Y= channels");
     } else if (!strcmp(type, "message") && g->authed && matches(guild, g->guild) && matches(channel, g->channel)) {
-        if (*id && !matches(id, g->history_req)) return;
-        const char *message_id = wire_string(&object, "message_id");
-        if (!wire_id(message_id) || seen(message_id)) return;
-        char author[NAME_LEN], text[513], message[620];
-        display_ascii(author, sizeof(author), wire_string(&object, "author")); display_ascii(text, sizeof(text), wire_string(&object, "text"));
-        snprintf(message, sizeof(message), "<%s> %s%s", author, text, wire_bool(&object, "truncated") ? "..." : "");
-        append(message, message_id, COL_FG);
-        if (wire_uint(&object, "attachments", &number) && number) append("[attachment]", message_id, COL_MUTED);
+        if (*id && !matches(id, g->history_req)) { mem_free(r); return; }
+        const char *message_id = wire_string(&r->object, "message_id");
+        if (!wire_id(message_id) || seen(message_id)) { mem_free(r); return; }
+        display_ascii(r->author, sizeof(r->author), wire_string(&r->object, "author"));
+        display_ascii(r->text, sizeof(r->text), wire_string(&r->object, "text"));
+        snprintf(r->message, sizeof(r->message), "<%s> %s%s", r->author, r->text, wire_bool(&r->object, "truncated") ? "..." : "");
+        append(r->message, message_id, COL_FG);
+        if (wire_uint(&r->object, "attachments", &r->number) && r->number) append("[attachment]", message_id, COL_MUTED);
     } else if ((!strcmp(type, "message_deleted") || !strcmp(type, "message_changed")) &&
                g->authed && matches(guild, g->guild) && matches(channel, g->channel)) {
-        const char *message_id = wire_string(&object, "message_id");
-        if (!wire_id(message_id)) return;
+        const char *message_id = wire_string(&r->object, "message_id");
+        if (!wire_id(message_id)) { mem_free(r); return; }
         delete_message(message_id); (void)seen(message_id);
         if (!strcmp(type, "message_changed")) {
             g->refresh_history = g->can_history; status(g->can_history ? "Message edited; refreshing..." : "Edited message removed");
@@ -300,20 +406,29 @@ static void received(char *line) {
     } else if (!strcmp(type, "channels_changed") && matches(guild, g->guild)) {
         g->refresh_channels = true;
     } else if (!strcmp(type, "logged_out")) {
-        g->saved.token[0] = 0; save(); fail("Logged out");
+        g->saved.token[0] = 0;
+        g->save_pending = true;
+        mem_free(r); fail("Logged out"); return;
     } else if (!strcmp(type, "error")) {
-        const char *code = wire_string(&object, "code");
+        const char *code = wire_string(&r->object, "code");
         if (auth_response) {
-            g->saved.token[0] = 0; save();
-            if (g->resuming && !strcmp(code, "invalid_session")) { g->resuming = false; login(); return; }
-            fail(code); return;
+            g->saved.token[0] = 0;
+            g->save_pending = true;
+            if (g->resuming && !strcmp(code, "invalid_session")) { g->resuming = false; mem_free(r); login(); return; }
+            mem_free(r); fail(code); return;
         }
-        if (!strcmp(code, "session_expired") || !strcmp(code, "authentication_required")) { g->saved.token[0] = 0; save(); fail("Session expired; reconnect"); return; }
+        if (!strcmp(code, "session_expired") || !strcmp(code, "authentication_required"))
+        {
+            g->saved.token[0] = 0;
+            g->save_pending = true;
+            mem_free(r); fail("Session expired; reconnect"); return;
+        }
         if (list_response || matches(id, g->select_req)) { g->busy = false; g->list_req[0] = g->select_req[0] = 0; }
         if (matches(id, g->history_req)) { g->history_busy = false; g->history_req[0] = 0; }
         if (matches(id, g->send_req)) { g->send_pending = false; g->send_req[0] = 0; }
         status("%s", code);
     }
+    mem_free(r);
 }
 
 static void feed(char c) {
@@ -322,13 +437,79 @@ static void feed(char c) {
     else if (g->rx_len < FRAME_LEN - 1) g->rx[g->rx_len++] = c;
     else fail("Relay frame exceeds 4096 bytes");
 }
+static void capture_traceback(void)
+{
+    uint8_t count = 0;
+    const struct lwip_traceback_entry *entries = lwip_get_traceback(&count);
+    g->traceback_count = count > TRACE_MAX ? TRACE_MAX : count;
+    g->traceback_scroll = 0;
+    for (uint8_t i = 0; i < g->traceback_count; ++i)
+    {
+        const struct lwip_traceback_entry *e = &entries[i];
+        if (e->file)
+        {
+            snprintf(g->traceback[i], sizeof(g->traceback[i]), "%s:%lu x%u",
+                     lwip_debug_file_name(e->file), (unsigned long)e->line,
+                     (unsigned)e->extra);
+        }
+        else
+        {
+            snprintf(g->traceback[i], sizeof(g->traceback[i]),
+                     "socket c%u o%u r%d e%u s%u", (unsigned)e->component,
+                     (unsigned)e->operation, e->raw_error,
+                     (unsigned)e->mapped_error, (unsigned)e->status);
+        }
+    }
+}
+/* Keep diagnostics in memory; drawing from a stack callback disrupts the UI. */
+static void stack_event(const struct lwip_event *ev)
+{
+    if (!g || g->done || !g->created || !ev)
+        return;
+    if (ev->kind == LWIP_EV_INFO && ev->module == LWIP_DBG_MOD_TLS)
+        copy(g->tls_step, sizeof(g->tls_step), ev->data.msg ? ev->data.msg : "");
+    if (ev->kind == LWIP_EV_ERROR)
+    {
+        char detail[sizeof(g->stack_error)];
+        snprintf(detail, sizeof(detail), "%s:%lu x%u",
+                 lwip_debug_file_name(LWIP_EVENT_CODE_FILE(ev->data.code.loc)),
+                 (unsigned long)LWIP_EVENT_CODE_LINE(ev->data.code.loc),
+                 (unsigned)ev->data.code.extra);
+        /* ARP/DHCP can emit benign diagnostics during a handshake. Retain a
+         * system error only until a TLS error gives the relevant cause. */
+        if (ev->module == LWIP_DBG_MOD_TLS || !g->stack_error[0])
+            copy(g->stack_error, sizeof(g->stack_error), detail);
+    }
+}
 static void event(struct lwip_socket *socket, lwip_socket_event_type_t type, const void *data, void *arg) {
     (void)socket; (void)arg;
-    if (type == LWIP_SOCKET_EV_ERROR) { fail("Network/TLS error; reconnect"); return; }
+    /* Teardown can enqueue more events; preserve the original failure. */
+    if (g->done)
+        return;
+    if (type == LWIP_SOCKET_EV_ERROR)
+    {
+        const lwip_socket_error_data_t *e = data;
+        copy(g->failure_phase, sizeof(g->failure_phase), !g->connected ? "Before TLS connected" : g->stage == CONNECTING ? "Waiting for relay hello"
+                                                                                                                         : "Relay session");
+        if (e)
+            status("Net err c%u o%u r%d e%u", (unsigned)e->component, (unsigned)e->operation, e->raw_error, (unsigned)e->err);
+        else
+            status("Network error; no details");
+        capture_traceback();
+        g->done = true;
+        g->connected = false;
+        clear_selection();
+        return;
+    }
     if (type == LWIP_SOCKET_EV_STATE_CHANGE) {
         const lwip_socket_state_data_t *state = data;
         if (state->current == LWIP_STATUS_CONNECTED) { g->connected = true; status("TLS connected; waiting for relay"); }
-        else if (state->current == LWIP_STATUS_CLOSED || state->current == LWIP_STATUS_RESET) fail("Disconnected; reconnect from setup");
+        else if (state->current == LWIP_STATUS_CLOSED || state->current == LWIP_STATUS_RESET)
+        {
+            copy(g->failure_phase, sizeof(g->failure_phase), "Relay session closed");
+            capture_traceback();
+            fail("Disconnected; reconnect from setup");
+        }
     }
 }
 
@@ -355,7 +536,18 @@ static void render(void) {
     fill(0, 0, 320, 16, COL_PURPLE);
     snprintf(line, sizeof(line), "Discord %.14s | %.16s", g->saved.username, g->guild_name);
     text(2, 4, COL_FG, COL_PURPLE, line, 39);
-    if (g->done) { text(4, 40, COL_ERROR, COL_BG, g->status, 39); text(4, 64, COL_FG, COL_BG, "Enter: setup     Mode: exit", 39); }
+    if (g->done)
+    {
+        text(4, 40, COL_ERROR, COL_BG, g->status, 39);
+        text(4, 56, COL_FG, COL_BG, g->failure_phase, 39);
+        snprintf(line, sizeof(line), "TLS: %.31s  Traceback (newest)", g->tls_step);
+        text(4, 72, COL_MUTED, COL_BG, line, 39);
+        if (!g->traceback_count)
+            text(4, 88, COL_FG, COL_BG, "No traceback entries captured", 39);
+        for (uint8_t row = 0; row < 17 && row + g->traceback_scroll < g->traceback_count; ++row)
+            text(4, 88 + row * 8, COL_FG, COL_BG,
+                 g->traceback[row + g->traceback_scroll], 39);
+    }
     else if (g->stage <= CONFIRM) panel();
     else {
         fill(0, 16, CHAT_X - 2, 208, COL_PANEL);
@@ -379,7 +571,8 @@ static void render(void) {
         }
     }
     fill(0, 224, 320, 16, COL_PANEL); text(2, 225, COL_FG, COL_PANEL, g->status, 39);
-    text(2, 233, COL_MUTED, COL_PANEL, "Y=:channels Window:servers Mode:back", 39);
+    text(2, 233, COL_MUTED, COL_PANEL,
+         g->done ? "Up/Down: trace Enter: setup Mode: exit" : "Y=:ch Window:srv Mode:disc Clear:quit", 39);
     gfx_BlitBuffer(); g->dirty = false;
 }
 static void palette(void) {
@@ -396,9 +589,15 @@ static char input_char(uint8_t key) {
 }
 static void handle_key(uint8_t key) {
     if (!key || g->logout_pending) return;
+    if (key == sk_Clear && g->stage > CONFIRM) { g->done = g->quit = true; clear_selection(); status("Goodbye"); return; }
     if (key == sk_Mode) { g->done = true; clear_selection(); status("Disconnected"); return; }
     if (key == sk_Graph && g->authed) {
-        g->saved.token[0] = 0; save(); g->logout_pending = true; request(NULL, "logout", NULL); status("Logging out..."); return;
+        g->saved.token[0] = 0;
+        g->save_pending = true;
+        g->logout_pending = true;
+        request(NULL, "logout", NULL);
+        status("Logging out...");
+        return;
     }
     if (g->stage <= CONFIRM) {
         if (key == sk_Clear) { fail("Login cancelled"); return; }
@@ -436,15 +635,17 @@ static void handle_key(uint8_t key) {
     else if (key == sk_Trace) { g->refresh_history = g->can_history; }
     else if (!g->send_pending) {
         size_t len = strlen(g->input);
-        if (key == sk_Clear) g->input[0] = 0;
-        else if (key == sk_Del && len) g->input[len - 1] = 0;
+        if (key == sk_Del && len) g->input[len - 1] = 0;
         else if (key == sk_Enter && len) {
             if (!g->channel[0] || !g->can_send || g->busy) { status("Select a writable channel"); return; }
-            char quoted[INPUT_LEN * 2 + 3], extra[INPUT_LEN * 2 + 20];
-            if (wire_quote(quoted, sizeof(quoted), g->input)) {
-                snprintf(extra, sizeof(extra), ",\"text\":%s", quoted);
+            char *quoted = mem_malloc(INPUT_LEN * 2 + 3);
+            char *extra  = mem_malloc(INPUT_LEN * 2 + 20);
+            if (!quoted || !extra) { mem_free(quoted); mem_free(extra); status("Out of memory"); return; }
+            if (wire_quote(quoted, INPUT_LEN * 2 + 3, g->input)) {
+                snprintf(extra, INPUT_LEN * 2 + 20, ",\"text\":%s", quoted);
                 if (request(g->send_req, "send", extra)) { g->send_pending = true; status("Sending..."); }
             }
+            mem_free(quoted); mem_free(extra);
         } else {
             char c = input_char(key);
             if (c && len + 1 < sizeof(g->input)) { g->input[len] = c; g->input[len + 1] = 0; }
@@ -468,8 +669,9 @@ static bool setup(void) {
             else if (!wire_target(g->saved.target, g->host, sizeof(g->host), RELAY_DEFAULT_PORT, &g->port)) status("Use host:port or tls://host:port");
             else if (!g->saved.username[0]) status("Enter a local username/profile");
             else {
-                if (strcmp(original_target, g->saved.target) || strcmp(original_user, g->saved.username)) g->saved.token[0] = 0;
-                save(); return true;
+                save();
+                if (strcmp(original_target, g->saved.target)) load_token();
+                return true;
             }
         } else {
             char c = input_char(key);
@@ -495,29 +697,63 @@ static bool setup(void) {
     }
 }
 static void run(void) {
-    g->done = g->connected = g->authed = g->created = g->logout_pending = false;
+    g->done = g->connected = g->authed = g->created = g->logout_pending = g->network_wait = false;
     g->panel[0] = 0; g->rx_len = 0; g->auth_seconds = 0; g->stage = CONNECTING;
+    g->stack_error[0] = g->tls_step[0] = g->failure_phase[0] = 0;
+    g->traceback_count = g->traceback_scroll = 0;
     clear_selection(); g->guild_name[0] = g->channel_name[0] = 0;
     lwip_error_t err = lwip_socket_create(&g->socket, LWIP_SOCKET_ALTCP_TLS, LWIP_NETIF_EXT, NULL, 45000u);
     if (err != LWIP_OK) { fail("Socket create failed"); return; } g->created = true;
     lwip_socket_on_event(&g->socket, LWIP_SOCKET_EVENTF_ALL, event, NULL);
-    /* The socket requests DHCP; explicitly request DNS and SNTP too. */
-    err = lwip_netif_request_services(g->socket.netif, LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS | LWIP_SOCKET_SVC_SNTP, 45000u, NULL, NULL);
-    if (err != LWIP_OK) { fail("Network service request failed"); return; }
-    status("Connecting to %.45s:%u", g->host, (unsigned)g->port); render();
-    err = lwip_socket_connect(&g->socket, g->host, g->port);
-    if (err != LWIP_OK) { fail("Connection failed"); return; }
-    g->last_ping = g->last_rx = g->request_time = lwip_now_ms();
+    /* Start services on this socket's interface. Poll readiness from our own
+     * loop so no callback outlives the connection during teardown. */
+    err = lwip_netif_request_services(g->socket.netif,
+                                      LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS |
+                                          LWIP_SOCKET_SVC_SNTP,
+                                      45000u, NULL, NULL);
+    if (err != LWIP_OK)
+    {
+        fail("Network service request failed");
+        return;
+    }
+    g->network_wait = true;
+    g->network_started = lwip_now_ms();
+    status("Waiting for DHCP/DNS (Mode cancels)");
+    render();
     while (!g->done) {
         lwip_service_events();
+        uint32_t now = lwip_now_ms();
+        if (g->network_wait)
+        {
+            if ((uint32_t)(now - g->network_started) >= 45000UL)
+                fail("Network timeout");
+            else if (lwip_are_services_ready(g->socket.netif,
+                                             LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS))
+            {
+                g->network_wait = false;
+                status("Connecting to %.45s:%u", g->host, (unsigned)g->port);
+                err = lwip_socket_connect(&g->socket, g->host, g->port);
+                if (err != LWIP_OK)
+                    fail("Connection failed");
+                else
+                    g->last_ping = g->last_rx = g->request_time = now;
+            }
+        }
         uint8_t bytes[128]; unsigned budget = FRAME_LEN * 2;
         while (!g->done && g->connected && lwip_socket_available(&g->socket) && budget) {
             size_t n = lwip_socket_read(&g->socket, bytes, sizeof(bytes)); if (!n) break;
             for (size_t i = 0; i < n && !g->done; ++i) feed((char)bytes[i]);
             budget = budget > n ? budget - n : 0;
         }
+        /* Do not enter the TLS send path while dispatching a received frame.
+         * In particular, authentication queues the first guild request here. */
+        if (g->initial_guilds_pending && g->connected && !g->done)
+        {
+            g->initial_guilds_pending = false;
+            list_page(0);
+        }
         handle_key(os_GetCSC());
-        uint32_t now = lwip_now_ms();
+        now = lwip_now_ms();
         if (g->connected && !g->done && (uint32_t)(now - g->last_ping) >= 30000UL) { request(NULL, "ping", NULL); g->last_ping = now; }
         if (g->connected && (uint32_t)(now - g->last_rx) >= 90000UL) fail("Relay not responding; reconnect");
         if (g->authed && (g->busy || g->history_busy || g->send_pending) && (uint32_t)(now - g->request_time) >= 60000UL)
@@ -536,16 +772,34 @@ int main(void) {
     g = mem_request(sizeof(*g));
     if (!g) { lwip_example_show_and_wait("Discord", "Not enough memory"); return lwip_example_finish(1); }
     memset(g, 0, sizeof(*g)); palette(); load();
-    while (setup()) {
+    lwip_set_event_cb(stack_event);
+    while (!g->quit && setup()) {
         run();
         if (g->created) { lwip_socket_destroy(&g->socket); g->created = false; }
+        if (g->save_pending) { save_token(); g->save_pending = false; }
+        if (g->quit) break;
         clear_selection(); g->done = true; render();
         uint8_t key = 0;
-        while (key != sk_Enter && key != sk_Mode && key != sk_Clear) { lwip_service_events(); key = os_GetCSC(); }
+        while (key != sk_Enter && key != sk_Mode && key != sk_Clear)
+        {
+            lwip_service_events();
+            key = os_GetCSC();
+            if (key == sk_Up && g->traceback_scroll)
+            {
+                --g->traceback_scroll;
+                render();
+            }
+            if (key == sk_Down && g->traceback_scroll + 17 < g->traceback_count)
+            {
+                ++g->traceback_scroll;
+                render();
+            }
+        }
         if (key != sk_Enter) break;
         g->status[0] = 0;
     }
     /* Tokens are saved on authentication, not on exit after an edited profile. */
+    lwip_set_event_cb(NULL);
     memset(g, 0, sizeof(*g)); mem_release(g); g = NULL;
     return lwip_example_finish(0);
 }

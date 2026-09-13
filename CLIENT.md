@@ -104,6 +104,27 @@ USB adapter, TLS handshake, or the registered OIDC application.
 
 ## TLS dependency status
 
+For connection failures, the disconnect screen preserves the socket error,
+whether TLS had connected, the last TLS progress message, and the first stack
+error's source file, line, and extra code. Record these fields together when
+reporting a failure. Diagnostic fields can be blank if the runtime does not
+emit the corresponding events. Source lines must be matched to the lwIP build
+installed on the calculator.
+
+In the currently inspected consumer headers, component `6` is `ALTCP` (`TLS`
+is `7`), operation `4` is receive, and application error `6` is
+`LWIP_ERR_CONNECT` (`LWIP_ERR_CLOSED` is `8`). Raw error `-13` is `ERR_ABRT`:
+it can result from a local TLS failure or transport abort and does not by
+itself establish that the peer closed the connection.
+
+`hs: certificate` with `handshake.c:3964 x0` in the inspected lwIP source
+points to the generic fatal-alert sender, not a specific certificate failure.
+Certificate parsing, date validity, hostname matching, and allocations can
+fail earlier without emitting a more specific error. Check the calculator's
+date/time and use the hostname covered by the relay certificate. The client
+requests background SNTP; lwIP's SNTP service-ready flag means the service
+has started, not that the clock has synchronized.
+
 The client always uses lwIP's TLS socket transport and does not disable its
 certificate checks. The relay certificate must match the entered target and
 the runtime's supported certificate/handshake profile.

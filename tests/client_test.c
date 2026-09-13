@@ -7,8 +7,10 @@
 static void reset(void) {
     static app_t app;
     memset(&app, 0, sizeof(app)); g = &app; g->connected = true;
-    memcpy(g->saved.magic, "DSC3", 4); g->saved.version = 3;
+    memcpy(g->saved.magic, "DSC4", 4); g->saved.version = 4;
     test_tx[0] = 0; test_key_pos = 0; test_time = 1000;
+    test_services_ready = true;
+    for (int i = 0; i < 2; ++i) { test_appvars[i].size = 0; test_appvars[i].exists = false; test_appvars[i].pos = 0; }
 }
 static void rx(const char *s) { char buffer[4096]; copy(buffer, sizeof(buffer), s); received(buffer); }
 static void active(void) {
@@ -39,7 +41,8 @@ static void test_targets(void) {
     for (unsigned i = 0; i < sizeof(bad)/sizeof(*bad); ++i) assert(!wire_target(bad[i], host, sizeof(host), 8443, &port));
 }
 static void test_login(void) {
-    reset(); rx("{\"type\":\"hello\",\"version\":2}"); assert(strstr(test_tx, "\"op\":\"login\""));
+    reset(); copy(g->saved.target, sizeof(g->saved.target), "relay.example:8443");
+    rx("{\"type\":\"hello\",\"version\":2}"); assert(strstr(test_tx, "\"op\":\"login\""));
     rx("{\"type\":\"device\",\"id\":\"r1\",\"user_code\":\"ABCD\",\"verification_uri\":\"https://id.example/verify\",\"expires_in\":600}");
     assert(g->stage == LOGIN && strstr(g->panel, "ABCD"));
     rx("{\"type\":\"link_required\",\"id\":\"r1\",\"code\":\"0123456789ABCDEF\",\"expires_in\":300}");
@@ -48,19 +51,33 @@ static void test_login(void) {
     assert(g->stage == CONFIRM && !g->authed);
     handle_key(sk_Enter); assert(strstr(test_tx, "link_confirm") && strstr(test_tx, "123"));
     rx("{\"type\":\"authenticated\",\"id\":\"r2\",\"token\":\"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG\",\"discord_id\":\"123\"}");
-    assert(g->authed && g->stage == GUILDS && strstr(test_tx, "guilds"));
+    assert(g->authed && g->stage == GUILDS && g->initial_guilds_pending);
+    g->initial_guilds_pending = false; list_page(0); assert(strstr(test_tx, "guilds"));
     assert(token_valid(g->saved.token));
-    load(); assert(token_valid(g->saved.token));
+    /* Token must be written to DISCTK immediately on authentication. */
+    assert(test_appvars[1].exists && test_appvars[1].size > 1);
 }
 static void test_resume_fallback_and_profile_binding(void) {
     reset(); copy(g->saved.token, TOKEN_LEN, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG");
     rx("{\"type\":\"hello\",\"version\":2}"); assert(strstr(test_tx, "resume"));
     rx("{\"type\":\"error\",\"id\":\"r1\",\"code\":\"invalid_session\"}");
     assert(!g->saved.token[0] && strstr(test_tx, "login"));
-    reset(); copy(g->saved.target, sizeof(g->saved.target), "192.0.2.1:9443"); copy(g->saved.username, sizeof(g->saved.username), "Alice");
+    /* Token store: save a token for one target, switch to another, token clears. */
+    reset(); copy(g->saved.target, sizeof(g->saved.target), "192.0.2.1:9443");
+    copy(g->saved.username, sizeof(g->saved.username), "Alice");
     copy(g->saved.token, TOKEN_LEN, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG");
+    save_token(); /* store token for 192.0.2.1:9443 */
+    copy(g->saved.target, sizeof(g->saved.target), "other.example:9443");
+    load_token(); /* no entry for other.example:9443 */
+    assert(!g->saved.token[0]);
+    copy(g->saved.target, sizeof(g->saved.target), "192.0.2.1:9443");
+    load_token(); /* back to original target — token restored */
+    assert(token_valid(g->saved.token));
+    /* setup() accepts existing target without changing it; port is parsed */
+    reset(); copy(g->saved.target, sizeof(g->saved.target), "192.0.2.1:9443");
+    copy(g->saved.username, sizeof(g->saved.username), "Alice");
     test_keys[0] = sk_Enter; test_keys[1] = 100; test_keys[2] = sk_Enter;
-    assert(setup()); assert(!g->saved.token[0] && g->port == 9443);
+    assert(setup()); assert(g->port == 9443);
 }
 static void test_channel_negotiation(void) {
     active(); g->entries[0].send = g->entries[0].history = true;
@@ -122,11 +139,50 @@ static void test_bounded_parser_and_transcript(void) {
     assert(g->row_count == ROWS && !strcmp(g->rows[ROWS - 1].id, "200"));
     append("old", "1", COL_FG); assert(g->row_count == ROWS && strcmp(g->rows[0].id, "1"));
 }
+static void test_network_diagnostics(void) {
+    reset(); g->connected = false; g->created = true;
+    struct lwip_event trace = { .module = LWIP_DBG_MOD_TLS, .kind = LWIP_EV_INFO,
+                               .data.msg = "serverhello: fail" };
+    stack_event(&trace);
+    trace.kind = LWIP_EV_ERROR; trace.data.code.loc = (2UL << 24) | 123;
+    trace.data.code.extra = 40; stack_event(&trace);
+    trace.data.code.loc = (2UL << 24) | 456; stack_event(&trace);
+    lwip_socket_error_data_t error = { .component = 6, .operation = 4, .raw_error = -13, .err = 6 };
+    event(&g->socket, LWIP_SOCKET_EV_ERROR, &error, NULL);
+    assert(g->done && !g->connected);
+    assert(!strcmp(g->failure_phase, "Before TLS connected"));
+    assert(!strcmp(g->tls_step, "serverhello: fail"));
+    assert(!strcmp(g->stack_error, "handshake.c:456 x40"));
+    assert(!strcmp(g->status, "Net err c6 o4 r-13 e6"));
+    lwip_socket_state_data_t state = { .current = LWIP_STATUS_CLOSED };
+    event(&g->socket, LWIP_SOCKET_EV_STATE_CHANGE, &state, NULL);
+    state.current = LWIP_STATUS_CONNECTED;
+    event(&g->socket, LWIP_SOCKET_EV_STATE_CHANGE, &state, NULL);
+    assert(!g->connected && !strcmp(g->status, "Net err c6 o4 r-13 e6"));
+    reset(); g->stage = CONNECTING; g->connected = true;
+    event(&g->socket, LWIP_SOCKET_EV_ERROR, &error, NULL);
+    assert(!strcmp(g->failure_phase, "Waiting for relay hello"));
+    reset(); event(&g->socket, LWIP_SOCKET_EV_ERROR, NULL, NULL);
+    assert(g->done && !strcmp(g->status, "Network error; no details"));
+    reset(); g->created = true;
+    trace.module = 0; trace.kind = LWIP_EV_ERROR; trace.data.code.loc = (3UL << 24) | 439;
+    trace.data.code.extra = 65520; stack_event(&trace);
+    assert(!strcmp(g->stack_error, "handshake.c:439 x65520"));
+    trace.module = LWIP_DBG_MOD_TLS; trace.data.code.loc = (2UL << 24) | 3000;
+    trace.data.code.extra = 0; stack_event(&trace);
+    assert(!strcmp(g->stack_error, "handshake.c:3000 x0"));
+    reset(); test_service_error = 1;
+    run();
+    assert(g->done && !strcmp(g->status, "Network service request failed"));
+    assert(test_service_flags == (LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS | LWIP_SOCKET_SVC_SNTP));
+    test_service_error = LWIP_OK;
+}
 int main(void) {
     palette();
     test_wire(); test_targets(); test_login(); test_resume_fallback_and_profile_binding();
     test_channel_negotiation(); test_history_live_merge_and_delete(); test_send_ack_and_fragmented_frames();
     test_pagination_and_stale_replies(); test_bounded_parser_and_transcript();
-    printf("9 client test groups passed; state size %zu bytes (host ABI)\n", sizeof(app_t));
+    test_network_diagnostics();
+    printf("10 client test groups passed; state size %zu bytes (host ABI)\n", sizeof(app_t));
     return 0;
 }
