@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run host tests
+        run: |
+          clang -std=c11 -Wall -Wextra -Werror \
+            -fsanitize=address,undefined \
+            -g \
+            tests/client_test.c src/wire.c \
+            -o /tmp/discord-ce-client-test
+          /tmp/discord-ce-client-test

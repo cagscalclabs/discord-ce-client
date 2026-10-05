@@ -13,7 +13,7 @@ typedef int lwip_socket_event_type_t;
 struct netif { int unused; };
 typedef struct { uint8_t service_id, status, ready_bitmap; } lwip_netif_service_event_t;
 enum { LWIP_NETIF_SERVICE_UP, LWIP_NETIF_SERVICE_FAILED, LWIP_NETIF_SERVICE_TIMEOUT };
-struct lwip_socket { void *netif; };
+struct lwip_socket;
 typedef struct { int current; } lwip_socket_state_data_t;
 typedef struct { uint16_t component, operation; int raw_error; lwip_error_t err; int status; } lwip_socket_error_data_t;
 enum { LWIP_EV_INFO, LWIP_EV_ERROR, LWIP_DBG_MOD_TLS };
@@ -87,7 +87,10 @@ static uint32_t lwip_now_ms(void) { return test_time; }
 static lwip_error_t lwip_socket_write(struct lwip_socket *s, const uint8_t *p, size_t n) {
     (void)s; assert(n < sizeof(test_tx)); memcpy(test_tx, p, n); test_tx[n] = 0; return LWIP_OK;
 }
-static int lwip_socket_create(struct lwip_socket *s, int t, int b, void *a, unsigned long ms) { (void)s;(void)t;(void)b;(void)a;(void)ms; return 0; }
+static struct lwip_socket *lwip_socket_stub_obj;
+static struct lwip_socket *lwip_socket_create(int t, int b, void *a, unsigned long ms) { (void)t;(void)b;(void)a;(void)ms; return lwip_socket_stub_obj; }
+static lwip_error_t lwip_socket_last_error(const struct lwip_socket *s) { (void)s; return LWIP_OK; }
+static struct netif *lwip_socket_get_netif(const struct lwip_socket *s) { (void)s; return NULL; }
 static void lwip_socket_on_event(struct lwip_socket *s, int t, void (*cb)(struct lwip_socket *, int, const void *, void *), void *arg) { (void)s;(void)t;(void)cb;(void)arg; }
 static lwip_error_t test_service_error;
 static int test_service_flags;

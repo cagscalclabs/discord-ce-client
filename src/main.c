@@ -57,7 +57,7 @@ typedef struct {
 } saved_t;
 typedef struct {
     saved_t saved;
-    struct lwip_socket socket;
+    struct lwip_socket *socket;
     bool connected, done, quit, created, authed, dirty, picker, busy, history_busy, network_wait;
     bool refresh_channels, refresh_history, send_pending, logout_pending, save_pending, initial_guilds_pending;
     bool can_send, can_history, resuming;
@@ -97,9 +97,14 @@ static void save(void) {
 }
 /* Token AppVar (DISCTK): flat array of token_entry_t, one per relay target.
  * save_token() upserts by target; load_token() looks up by current target. */
+static void archive_token(void) {
+    uint8_t file = ti_Open("DISCTK", "r+");
+    if (file) { ti_SetArchiveStatus(true, file); ti_Close(file); }
+}
 static void save_token(void) {
     if (!g->saved.token[0] || !g->saved.target[0]) return;
     token_entry_t e;
+    /* "r+" on an archived file unarchives it; if that fails (low RAM), try "w" to start fresh. */
     uint8_t file = ti_Open("DISCTK", "r+");
     if (!file) {
         file = ti_Open("DISCTK", "w");
@@ -112,27 +117,24 @@ static void save_token(void) {
     uint8_t count = 0;
     ti_Rewind(file); ti_Read(&count, 1, 1, file);
     if (count > TOKEN_ENTRY_MAX) count = TOKEN_ENTRY_MAX;
-    /* Scan for existing entry with matching target. */
     for (uint8_t i = 0; i < count; ++i) {
         uint16_t pos = ti_Tell(file);
         if (ti_Read(&e, sizeof(e), 1, file) != 1) break;
         if (!memchr(e.target, 0, sizeof(e.target)) || !memchr(e.token, 0, sizeof(e.token))) continue;
         if (!strcmp(e.target, g->saved.target)) {
-            /* Overwrite just the token field in-place. */
             copy(e.token, sizeof(e.token), g->saved.token);
             ti_Seek(pos, SEEK_SET, file);
             ti_Write(&e, sizeof(e), 1, file);
-            ti_SetArchiveStatus(true, file); ti_Close(file); return;
+            ti_Close(file); archive_token(); return;
         }
     }
-    /* Not found: append if under the cap; evict entry 0 (oldest) if full. */
     if (count < TOKEN_ENTRY_MAX) {
         copy(e.target, sizeof(e.target), g->saved.target);
         copy(e.token, sizeof(e.token), g->saved.token);
         ti_Write(&e, sizeof(e), 1, file);
         ++count; ti_Rewind(file); ti_Write(&count, 1, 1, file);
     }
-    ti_SetArchiveStatus(true, file); ti_Close(file);
+    ti_Close(file); archive_token();
 }
 static void load_token(void) {
     g->saved.token[0] = 0;
@@ -257,7 +259,7 @@ static bool request(char *tracker, const char *op, const char *extra) {
         status("Request too long");
         return false;
     }
-    if (!g->connected || lwip_socket_write(&g->socket, (const uint8_t *)frame, (size_t)n) != LWIP_OK) {
+    if (!g->connected || lwip_socket_write(g->socket, (const uint8_t *)frame, (size_t)n) != LWIP_OK) {
         mem_free(frame);
         fail("Connection lost; send outcome unknown");
         return false;
@@ -702,12 +704,12 @@ static void run(void) {
     g->stack_error[0] = g->tls_step[0] = g->failure_phase[0] = 0;
     g->traceback_count = g->traceback_scroll = 0;
     clear_selection(); g->guild_name[0] = g->channel_name[0] = 0;
-    lwip_error_t err = lwip_socket_create(&g->socket, LWIP_SOCKET_ALTCP_TLS, LWIP_NETIF_EXT, NULL, 45000u);
-    if (err != LWIP_OK) { fail("Socket create failed"); return; } g->created = true;
-    lwip_socket_on_event(&g->socket, LWIP_SOCKET_EVENTF_ALL, event, NULL);
+    g->socket = lwip_socket_create(LWIP_SOCKET_ALTCP_TLS, LWIP_NETIF_EXT, NULL, 45000u);
+    if (!g->socket) { fail("Socket create failed"); return; } g->created = true;
+    lwip_socket_on_event(g->socket, LWIP_SOCKET_EVENTF_ALL, event, NULL);
     /* Start services on this socket's interface. Poll readiness from our own
      * loop so no callback outlives the connection during teardown. */
-    err = lwip_netif_request_services(g->socket.netif,
+    lwip_error_t err = lwip_netif_request_services(lwip_socket_get_netif(g->socket),
                                       LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS |
                                           LWIP_SOCKET_SVC_SNTP,
                                       45000u, NULL, NULL);
@@ -727,12 +729,13 @@ static void run(void) {
         {
             if ((uint32_t)(now - g->network_started) >= 45000UL)
                 fail("Network timeout");
-            else if (lwip_are_services_ready(g->socket.netif,
-                                             LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS))
+            else if (lwip_are_services_ready(lwip_socket_get_netif(g->socket),
+                                             LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS |
+                                                 LWIP_SOCKET_SVC_SNTP))
             {
                 g->network_wait = false;
                 status("Connecting to %.45s:%u", g->host, (unsigned)g->port);
-                err = lwip_socket_connect(&g->socket, g->host, g->port);
+                err = lwip_socket_connect(g->socket, g->host, g->port);
                 if (err != LWIP_OK)
                     fail("Connection failed");
                 else
@@ -740,8 +743,8 @@ static void run(void) {
             }
         }
         uint8_t bytes[128]; unsigned budget = FRAME_LEN * 2;
-        while (!g->done && g->connected && lwip_socket_available(&g->socket) && budget) {
-            size_t n = lwip_socket_read(&g->socket, bytes, sizeof(bytes)); if (!n) break;
+        while (!g->done && g->connected && lwip_socket_available(g->socket) && budget) {
+            size_t n = lwip_socket_read(g->socket, bytes, sizeof(bytes)); if (!n) break;
             for (size_t i = 0; i < n && !g->done; ++i) feed((char)bytes[i]);
             budget = budget > n ? budget - n : 0;
         }
@@ -775,7 +778,7 @@ int main(void) {
     lwip_set_event_cb(stack_event);
     while (!g->quit && setup()) {
         run();
-        if (g->created) { lwip_socket_destroy(&g->socket); g->created = false; }
+        if (g->created) { lwip_socket_destroy(g->socket); g->socket = NULL; g->created = false; }
         if (g->save_pending) { save_token(); g->save_pending = false; }
         if (g->quit) break;
         clear_selection(); g->done = true; render();
