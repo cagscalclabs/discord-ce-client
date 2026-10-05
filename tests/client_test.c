@@ -4,15 +4,22 @@
 #undef main
 #include <assert.h>
 
+static int fake_socket_storage;
 static void reset(void) {
     static app_t app;
     memset(&app, 0, sizeof(app)); g = &app; g->connected = true;
     memcpy(g->saved.magic, "DSC4", 4); g->saved.version = 4;
     test_tx[0] = 0; test_key_pos = 0; test_time = 1000;
     test_services_ready = true;
+    lwip_socket_stub_obj = (struct lwip_socket *)&fake_socket_storage;
     for (int i = 0; i < 2; ++i) { test_appvars[i].size = 0; test_appvars[i].exists = false; test_appvars[i].pos = 0; }
 }
 static void rx(const char *s) { char buffer[4096]; copy(buffer, sizeof(buffer), s); received(buffer); }
+static const char *nth_message_id(unsigned n) {
+    const char *p = g->chat_buf;
+    for (unsigned i = 0; i < n; ++i) p = msg_at(p).next;
+    return msg_at(p).id;
+}
 static void active(void) {
     reset(); g->stage = CHAT; g->authed = true; g->can_send = g->can_history = true;
     copy(g->guild, ID_LEN, "10"); copy(g->channel, ID_LEN, "20");
@@ -87,7 +94,7 @@ static void test_channel_negotiation(void) {
     rx("{\"type\":\"selected_channel\",\"id\":\"r1\",\"guild_id\":\"10\",\"channel_id\":\"21\"}");
     assert(!strcmp(g->channel, "21") && !g->picker && strstr(test_tx, "history"));
     rx("{\"type\":\"message\",\"guild_id\":\"10\",\"channel_id\":\"20\",\"message_id\":\"100\",\"text\":\"old\"}");
-    assert(g->row_count == 0);
+    assert(g->chat_count == 0);
     rx("{\"type\":\"reset\",\"reason\":\"access_changed\"}"); assert(!g->channel[0] && g->stage == GUILDS);
     rx("{\"type\":\"selected_channel\",\"id\":\"r1\",\"guild_id\":\"10\",\"channel_id\":\"21\"}"); assert(!g->channel[0]);
 }
@@ -97,15 +104,15 @@ static void test_history_live_merge_and_delete(void) {
     rx("{\"type\":\"history_begin\",\"id\":\"r1\",\"channel_id\":\"20\"}");
     rx("{\"type\":\"message\",\"id\":\"r1\",\"guild_id\":\"10\",\"channel_id\":\"20\",\"message_id\":\"99\",\"author\":\"b\",\"text\":\"older\"}");
     rx("{\"type\":\"message\",\"id\":\"r1\",\"guild_id\":\"10\",\"channel_id\":\"20\",\"message_id\":\"101\",\"author\":\"a\",\"text\":\"live\"}");
-    assert(g->row_count == 2 && !strcmp(g->rows[0].id, "99") && !strcmp(g->rows[1].id, "101"));
+    assert(g->chat_count == 2 && !strcmp(nth_message_id(0), "99") && !strcmp(nth_message_id(1), "101"));
     rx("{\"type\":\"message_deleted\",\"guild_id\":\"10\",\"channel_id\":\"20\",\"message_id\":\"99\"}");
-    assert(g->row_count == 1);
+    assert(g->chat_count == 1);
     rx("{\"type\":\"message\",\"id\":\"r1\",\"guild_id\":\"10\",\"channel_id\":\"20\",\"message_id\":\"99\",\"text\":\"stale\"}");
-    assert(g->row_count == 1);
+    assert(g->chat_count == 1);
 }
 static void test_send_ack_and_fragmented_frames(void) {
     active(); copy(g->input, INPUT_LEN, "hello \"Discord\""); handle_key(sk_Enter);
-    assert(g->send_pending && g->row_count == 0 && strstr(test_tx, "\\\"Discord\\\""));
+    assert(g->send_pending && g->chat_count == 0 && strstr(test_tx, "\\\"Discord\\\""));
     rx("{\"type\":\"error\",\"id\":\"r1\",\"code\":\"rate_limited\"}");
     assert(!g->send_pending && g->input[0]); handle_key(sk_Enter);
     const char *frame = "{\"type\":\"sent\",\"id\":\"r2\"}\n";
@@ -135,9 +142,12 @@ static void test_bounded_parser_and_transcript(void) {
         input[len] = 0; (void)wire_parse(&obj, input);
     }
     active();
-    for (unsigned i = 1; i <= 200; ++i) { char id[21]; snprintf(id, sizeof(id), "%u", i); append("message", id, COL_FG); }
-    assert(g->row_count == ROWS && !strcmp(g->rows[ROWS - 1].id, "200"));
-    append("old", "1", COL_FG); assert(g->row_count == ROWS && strcmp(g->rows[0].id, "1"));
+    /* Fill well past CHAT_BUF capacity: eviction must drop whole oldest
+     * messages, never split one, and the buffer must never overflow. */
+    for (unsigned i = 1; i <= 800; ++i) { char id[21]; snprintf(id, sizeof(id), "%u", i); append("message", id, COL_FG); }
+    assert(g->chat_len <= sizeof(g->chat_buf) && g->chat_count > 0 && g->chat_count < 800);
+    assert(!strcmp(nth_message_id(g->chat_count - 1), "800"));
+    assert(!find_message("1", NULL)); /* the oldest message was evicted */
 }
 static void test_network_diagnostics(void) {
     reset(); g->connected = false; g->created = true;

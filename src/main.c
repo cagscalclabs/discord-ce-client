@@ -29,11 +29,13 @@
 #define PAGE 24
 #define ID_LEN 21
 #define NAME_LEN 81
-#define INPUT_LEN 121
+#define INPUT_LEN 128
 #define CHAT_COLS 28
-#define CHAT_ROWS 25
 #define CHAT_X 90
-#define ROWS 96
+#define CHAT_TOP 30
+#define CHAT_INPUT_Y 212
+#define CHAT_LINES ((CHAT_INPUT_Y - CHAT_TOP) / 8)
+#define CHAT_BUF 4096
 #define TOKEN_LEN 44
 #define TOKEN_ENTRY_MAX 32
 #define FRAME_LEN 4096
@@ -45,10 +47,12 @@
 #define COL_PURPLE 19
 #define COL_MUTED 20
 #define COL_ERROR 21
+#define COL_WARN 22
 
 typedef enum { CONNECTING, LOGIN, LINK, CONFIRM, GUILDS, CHAT } stage_t;
+typedef enum { STEP_NETWORK, STEP_DHCP, STEP_DNS, STEP_SNTP, STEP_CONNECT, STEP_COUNT } conn_step_t;
+typedef enum { STEP_PENDING, STEP_OK, STEP_FAILED } step_state_t;
 typedef struct { char id[ID_LEN], name[NAME_LEN]; bool send, history; } entry_t;
-typedef struct { char text[CHAT_COLS + 1], id[ID_LEN]; uint8_t color; } row_t;
 typedef struct { char target[128]; char token[TOKEN_LEN]; } token_entry_t;
 typedef struct {
     char magic[4]; uint8_t version;
@@ -58,7 +62,7 @@ typedef struct {
 typedef struct {
     saved_t saved;
     struct lwip_socket *socket;
-    bool connected, done, quit, created, authed, dirty, picker, busy, history_busy, network_wait;
+    bool connected, done, quit, created, authed, dirty, picker, busy, history_busy, network_wait, show_help;
     bool refresh_channels, refresh_history, send_pending, logout_pending, save_pending, initial_guilds_pending;
     bool can_send, can_history, resuming;
     stage_t stage;
@@ -68,11 +72,15 @@ typedef struct {
     char stack_error[80], tls_step[80], failure_phase[40];
     char traceback[TRACE_MAX][TRACE_LINE_LEN];
     uint8_t traceback_count, traceback_scroll;
+    uint8_t step_state[STEP_COUNT];
     uint32_t auth_started, auth_seconds, serial, page_offset, next_page, last_ping, last_rx, request_time, refresh_time, network_started;
     char auth_req[16], list_req[16], select_req[16], history_req[16], send_req[16];
     char selected[ID_LEN], selected_name[NAME_LEN]; bool selected_send, selected_history;
     entry_t entries[PAGE]; uint8_t count, cursor, top;
-    row_t rows[ROWS]; unsigned row_count, scroll;
+    /* Flat message blob: records packed back to back in ID-sorted order, each
+     * "<id>\0<color byte><text>\0". Eviction drops the oldest whole record
+     * (message-granular), never cutting a message off mid-line. */
+    char chat_buf[CHAT_BUF]; unsigned chat_len, chat_count, scroll;
     char seen[32][ID_LEN]; unsigned seen_count, seen_next;
     char input[INPUT_LEN]; uint8_t input_mode; bool shift;
     char rx[FRAME_LEN]; size_t rx_len;
@@ -181,7 +189,7 @@ static void load(void) {
 }
 
 static void clear_chat(void) {
-    g->row_count = g->scroll = g->seen_count = g->seen_next = 0;
+    g->chat_len = g->chat_count = g->scroll = g->seen_count = g->seen_next = 0;
     g->history_busy = g->refresh_history = false; g->history_req[0] = 0;
     g->input[0] = 0; g->send_pending = false; g->send_req[0] = 0; g->dirty = true;
 }
@@ -204,38 +212,73 @@ static void display_ascii(char *dst, size_t cap, const char *src) {
     }
     dst[n] = 0;
 }
-static void add_row(const char *text, const char *id, uint8_t color) {
-    unsigned pos = g->row_count;
+/* One packed message record: "<id>\0<color><text>\0". `next` points past it
+ * (== end of buffer when this is the last record). */
+typedef struct { const char *id; uint8_t color; const char *text; size_t size; const char *next; } msg_rec_t;
+static msg_rec_t msg_at(const char *p) {
+    msg_rec_t r; r.id = p; size_t id_len = strlen(p);
+    r.color = (uint8_t)p[id_len + 1]; r.text = p + id_len + 2;
+    size_t text_len = strlen(r.text);
+    r.size = id_len + 2 + text_len + 1; r.next = p + r.size;
+    return r;
+}
+static bool msg_id_less(const char *a, const char *b) {
     /* Snowflakes sort by decimal length, then lexically, without 64-bit arithmetic. */
-    for (unsigned i = 0; *id && i < g->row_count; ++i) {
-        const char *other = g->rows[i].id;
-        if (*other && (strlen(other) > strlen(id) || (strlen(other) == strlen(id) && strcmp(other, id) > 0))) { pos = i; break; }
+    size_t la = strlen(a), lb = strlen(b);
+    return la != lb ? la < lb : strcmp(a, b) < 0;
+}
+static bool find_message(const char *id, const char **out) {
+    for (const char *p = g->chat_buf; p < g->chat_buf + g->chat_len; ) {
+        msg_rec_t r = msg_at(p);
+        if (!strcmp(r.id, id)) { if (out) *out = p; return true; }
+        p = r.next;
     }
-    if (g->row_count == ROWS) {
-        if (!pos) return;
-        memmove(g->rows, g->rows + 1, sizeof(row_t) * (ROWS - 1)); --g->row_count; --pos;
+    return false;
+}
+static void add_message(const char *text, const char *id, uint8_t color) {
+    size_t id_len = strlen(id), text_len = strlen(text);
+    size_t size = id_len + 2 + text_len + 1;
+    if (size > sizeof(g->chat_buf)) return; /* single message larger than the whole buffer */
+    const char *insert = g->chat_buf + g->chat_len;
+    for (const char *p = g->chat_buf; p < g->chat_buf + g->chat_len; ) {
+        msg_rec_t r = msg_at(p);
+        if (*id && msg_id_less(id, r.id)) { insert = p; break; }
+        p = r.next;
     }
-    memmove(g->rows + pos + 1, g->rows + pos, sizeof(row_t) * (g->row_count - pos));
-    ++g->row_count;
-    row_t *row = &g->rows[pos]; copy(row->text, sizeof(row->text), text);
-    copy(row->id, sizeof(row->id), id); row->color = color;
+    unsigned pos = (unsigned)(insert - g->chat_buf);
+    /* Evict oldest whole messages (from the front) until there's room. */
+    while (g->chat_len + size > sizeof(g->chat_buf)) {
+        if (g->chat_len == 0) return;
+        msg_rec_t oldest = msg_at(g->chat_buf);
+        size_t evict = oldest.size;
+        if (evict >= g->chat_len) { g->chat_len = 0; pos = 0; --g->chat_count; continue; }
+        memmove(g->chat_buf, g->chat_buf + evict, g->chat_len - evict);
+        g->chat_len -= (unsigned)evict; --g->chat_count;
+        pos = pos > evict ? (unsigned)(pos - evict) : 0;
+    }
+    memmove(g->chat_buf + pos + size, g->chat_buf + pos, g->chat_len - pos);
+    char *dst = g->chat_buf + pos;
+    memcpy(dst, id, id_len); dst[id_len] = 0;
+    dst[id_len + 1] = (char)color;
+    memcpy(dst + id_len + 2, text, text_len); dst[id_len + 2 + text_len] = 0;
+    g->chat_len += (unsigned)size; ++g->chat_count;
 }
 static void append(const char *text, const char *id, uint8_t color) {
-    char row[CHAT_COLS + 1]; size_t len = strlen(text);
-    do {
-        size_t n = len < CHAT_COLS ? len : CHAT_COLS;
-        memcpy(row, text, n); row[n] = 0; add_row(row, id, color);
-        text += n; len -= n;
-    } while (len);
+    add_message(text, id, color);
     g->scroll = 0; g->dirty = true;
 }
 static void delete_message(const char *id) {
-    unsigned out = 0;
-    for (unsigned i = 0; i < g->row_count; ++i) if (strcmp(g->rows[i].id, id)) g->rows[out++] = g->rows[i];
-    g->row_count = out; g->scroll = 0; g->dirty = true;
+    const char *at;
+    while (find_message(id, &at)) {
+        msg_rec_t r = msg_at(at);
+        unsigned pos = (unsigned)(at - g->chat_buf);
+        memmove(g->chat_buf + pos, r.next, g->chat_len - (unsigned)(r.next - g->chat_buf));
+        g->chat_len -= (unsigned)r.size; --g->chat_count;
+    }
+    g->scroll = 0; g->dirty = true;
 }
 static bool seen(const char *id) {
-    for (unsigned i = 0; i < g->row_count; ++i) if (!strcmp(g->rows[i].id, id)) return true;
+    if (find_message(id, NULL)) return true;
     for (unsigned i = 0; i < g->seen_count; ++i) if (!strcmp(g->seen[i], id)) return true;
     copy(g->seen[g->seen_next], ID_LEN, id); g->seen_next = (g->seen_next + 1) % 32;
     if (g->seen_count < 32) ++g->seen_count; return false;
@@ -287,7 +330,7 @@ static void list_page(uint32_t offset) {
 static void history(void) {
     if (g->history_busy || !g->channel[0] || !g->can_history || g->busy) return;
     if (request(g->history_req, "history", ",\"limit\":20")) {
-        g->row_count = g->scroll = g->seen_count = g->seen_next = 0;
+        g->chat_len = g->chat_count = g->scroll = g->seen_count = g->seen_next = 0;
         g->history_busy = true; g->refresh_history = false; status("Loading history...");
     }
 }
@@ -367,8 +410,7 @@ static void received(char *line) {
         g->next_page = 0;
         if (wire_uint(&r->object, "next_offset", &r->number) && r->number > g->page_offset && r->number <= 100000UL) g->next_page = r->number;
         g->busy = false; g->list_req[0] = 0;
-        status(!g->count ? "No accessible entries; Y= reload" :
-               (g->picker || g->stage == GUILDS) ? "Up/Down, Enter to select" : "Enter sends; Y= channels");
+        status(!g->count ? "No accessible entries" : g->picker || g->stage == GUILDS ? "" : "Ready");
     } else if (!strcmp(type, "selected_guild") && matches(id, g->select_req)) {
         if (!matches(guild, g->selected)) { mem_free(r); fail("Server selection mismatch"); return; }
         clear_chat(); copy(g->guild, sizeof(g->guild), guild); copy(g->guild_name, sizeof(g->guild_name), g->selected_name);
@@ -378,12 +420,12 @@ static void received(char *line) {
         clear_chat(); copy(g->channel, sizeof(g->channel), channel); copy(g->channel_name, sizeof(g->channel_name), g->selected_name);
         g->can_send = g->selected_send; g->can_history = g->selected_history;
         g->busy = false; g->select_req[0] = 0; g->picker = false;
-        status(g->can_send ? "Enter sends; Y= channels" : "Read-only channel; Y= channels"); history();
+        status(g->can_send ? "" : "Read-only channel"); history();
     } else if (!strcmp(type, "history_begin") && matches(id, g->history_req) && matches(channel, g->channel)) {
         /* Keep live messages received while HTTP history was in flight. */
         g->dirty = true;
     } else if (!strcmp(type, "history_end") && matches(id, g->history_req) && matches(channel, g->channel)) {
-        g->history_busy = false; g->history_req[0] = 0; status("Enter sends; Y= channels");
+        g->history_busy = false; g->history_req[0] = 0; status("");
     } else if (!strcmp(type, "message") && g->authed && matches(guild, g->guild) && matches(channel, g->channel)) {
         if (*id && !matches(id, g->history_req)) { mem_free(r); return; }
         const char *message_id = wire_string(&r->object, "message_id");
@@ -483,6 +525,20 @@ static void stack_event(const struct lwip_event *ev)
             copy(g->stack_error, sizeof(g->stack_error), detail);
     }
 }
+static conn_step_t step_for_service(uint8_t service_id) {
+    switch (service_id) {
+        case LWIP_SOCKET_SVC_DHCP: return STEP_DHCP;
+        case LWIP_SOCKET_SVC_DNS:  return STEP_DNS;
+        default:                   return STEP_SNTP;
+    }
+}
+static void service_event(struct netif *netif, const lwip_netif_service_event_t *ev, void *arg) {
+    (void)netif; (void)arg;
+    if (!g || g->done || !ev) return;
+    conn_step_t step = step_for_service(ev->service_id);
+    g->step_state[step] = ev->status == LWIP_NETIF_SERVICE_UP ? STEP_OK : STEP_FAILED;
+    g->dirty = true;
+}
 static void event(struct lwip_socket *socket, lwip_socket_event_type_t type, const void *data, void *arg) {
     (void)socket; (void)arg;
     /* Teardown can enqueue more events; preserve the original failure. */
@@ -498,6 +554,7 @@ static void event(struct lwip_socket *socket, lwip_socket_event_type_t type, con
         else
             status("Network error; no details");
         capture_traceback();
+        if (g->stage == CONNECTING) g->step_state[STEP_CONNECT] = STEP_FAILED;
         g->done = true;
         g->connected = false;
         clear_selection();
@@ -505,11 +562,15 @@ static void event(struct lwip_socket *socket, lwip_socket_event_type_t type, con
     }
     if (type == LWIP_SOCKET_EV_STATE_CHANGE) {
         const lwip_socket_state_data_t *state = data;
-        if (state->current == LWIP_STATUS_CONNECTED) { g->connected = true; status("TLS connected; waiting for relay"); }
+        if (state->current == LWIP_STATUS_CONNECTED) {
+            g->connected = true; g->step_state[STEP_CONNECT] = STEP_OK;
+            status("TLS connected; waiting for relay");
+        }
         else if (state->current == LWIP_STATUS_CLOSED || state->current == LWIP_STATUS_RESET)
         {
             copy(g->failure_phase, sizeof(g->failure_phase), "Relay session closed");
             capture_traceback();
+            if (g->stage == CONNECTING) g->step_state[STEP_CONNECT] = STEP_FAILED;
             fail("Disconnected; reconnect from setup");
         }
     }
@@ -523,6 +584,36 @@ static void text(int x, int y, uint8_t fg, uint8_t bg, const char *value, unsign
 static void fill(int x, int y, int w, int h, uint8_t color) {
     gfx_SetColor(color); gfx_FillRectangle(x, y, w, h);
 }
+/* Hard character-count wrap of one message's text into CHAT_COLS-wide lines,
+ * calling `emit` for each with its 0-based line index within the message. */
+static unsigned wrap_count(const char *text) {
+    size_t len = strlen(text);
+    return len ? (unsigned)((len + CHAT_COLS - 1) / CHAT_COLS) : 1;
+}
+/* Total wrapped display lines across every currently stored message. */
+static unsigned chat_line_count(void) {
+    unsigned total = 0;
+    for (const char *p = g->chat_buf; p < g->chat_buf + g->chat_len; ) {
+        msg_rec_t r = msg_at(p); total += wrap_count(r.text); p = r.next;
+    }
+    return total;
+}
+/* Draw the window of wrapped lines [start, end) (0-based, oldest-first) at
+ * CHAT_X, one 8px row per line starting at y=30. */
+static void chat_render_lines(unsigned start, unsigned end) {
+    unsigned line = 0;
+    for (const char *p = g->chat_buf; p < g->chat_buf + g->chat_len && line < end; ) {
+        msg_rec_t r = msg_at(p); unsigned lines = wrap_count(r.text); size_t tlen = strlen(r.text);
+        for (unsigned i = 0; i < lines && line < end; ++i, ++line) {
+            if (line < start) continue;
+            size_t off = (size_t)i * CHAT_COLS;
+            size_t n = tlen - off; if (n > CHAT_COLS) n = CHAT_COLS;
+            char buf[CHAT_COLS + 1]; memcpy(buf, r.text + off, n); buf[n] = 0;
+            text(CHAT_X, CHAT_TOP + (line - start) * 8, r.color, COL_BG, buf, CHAT_COLS);
+        }
+        p = r.next;
+    }
+}
 static void panel(void) {
     /* Preserve URL/code line breaks and offer scrolling rather than truncation. */
     const char *p = g->panel; unsigned row = 0, shown = 0;
@@ -531,6 +622,47 @@ static void panel(void) {
         while (*p && *p != '\n' && n < 39) line[n++] = *p++;
         if (*p == '\n') ++p; line[n] = 0;
         if (row++ >= g->panel_scroll) { text(2, 24 + shown * 8, COL_FG, COL_BG, line, 39); ++shown; }
+    }
+}
+static const char *step_label(conn_step_t step) {
+    switch (step) {
+        case STEP_NETWORK: return "Awaiting network";
+        case STEP_DHCP:    return "Awaiting DHCP";
+        case STEP_DNS:     return "Awaiting DNS";
+        case STEP_SNTP:    return "Awaiting SNTP";
+        default:           return "Connecting";
+    }
+}
+/* Popover listing the keybinds for the current context, toggled by sk_Mode.
+ * Centered over the chat/list area so it never fights the footer bar. */
+static void help(void) {
+    const char *lines[8]; unsigned n = 0;
+    if (g->stage == GUILDS || g->picker) {
+        lines[n++] = "Up/Down: move   Enter: select";
+        lines[n++] = "Left/Right: page   Clear: exit";
+    } else {
+        lines[n++] = "Enter: send   Del: backspace";
+        lines[n++] = "Up/Down: scroll history";
+        lines[n++] = "Y=: channels   Clear: servers";
+        lines[n++] = "Trace: refresh   Graph: log out";
+    }
+    lines[n++] = "Alpha: abc/ABC/123";
+    lines[n++] = "Mode: close this popup";
+    unsigned h = n * 8 + 10, y = (224 - h) / 2;
+    fill(20, y, 280, h, COL_PANEL);
+    fill(20, y, 280, 2, COL_PURPLE);
+    for (unsigned i = 0; i < n; ++i) text(26, y + 5 + i * 8, COL_FG, COL_PANEL, lines[i], 35);
+}
+static void steps(void) {
+    for (conn_step_t step = STEP_NETWORK; step < STEP_COUNT; ++step) {
+        unsigned y = 32 + step * 20;
+        uint8_t state = g->step_state[step];
+        uint8_t color = state == STEP_OK ? COL_FG : state == STEP_FAILED ? COL_ERROR : COL_WARN;
+        /* A filled square stands in for a status icon: a clearer at-a-glance
+         * cue than color-only text on a 320x240 screen viewed at arm's length. */
+        fill(12, y, 10, 10, color);
+        if (state == STEP_PENDING) fill(14, y + 2, 6, 6, COL_BG);
+        text(30, y + 1, state == STEP_PENDING ? COL_MUTED : COL_FG, COL_BG, step_label(step), 30);
     }
 }
 static void render(void) {
@@ -550,6 +682,7 @@ static void render(void) {
             text(4, 88 + row * 8, COL_FG, COL_BG,
                  g->traceback[row + g->traceback_scroll], 39);
     }
+    else if (g->stage == CONNECTING) steps();
     else if (g->stage <= CONFIRM) panel();
     else {
         fill(0, 16, CHAT_X - 2, 208, COL_PANEL);
@@ -563,23 +696,62 @@ static void render(void) {
         }
         text(0, 208, COL_MUTED, COL_PANEL, "<> pages", 10);
         text(CHAT_X, 18, COL_MUTED, COL_BG, g->stage == GUILDS ? "Choose a Discord server" : g->channel_name, CHAT_COLS);
-        unsigned end = g->row_count > g->scroll ? g->row_count - g->scroll : 0;
-        unsigned start = end > CHAT_ROWS - 2 ? end - (CHAT_ROWS - 2) : 0;
-        for (unsigned i = start; i < end; ++i) text(CHAT_X, 30 + (i - start) * 8, g->rows[i].color, COL_BG, g->rows[i].text, CHAT_COLS);
+        /* The input strip grows by one line for every CHAT_COLS-2 chars of
+         * typed text past the first line (the badge eats 2 cols on line 0
+         * only), shifting its top up so the chat area shrinks to make room
+         * instead of the text being clipped and hidden. */
+        unsigned input_cols0 = CHAT_COLS - 2;
+        size_t input_len = g->stage == CHAT && !g->picker ? strlen(g->input) : 0;
+        unsigned input_lines = input_len <= input_cols0 ? 1 :
+            1 + (unsigned)(((input_len - input_cols0) + (CHAT_COLS - 1)) / CHAT_COLS);
+        unsigned input_y = CHAT_INPUT_Y - (input_lines - 1) * 8;
+        unsigned lines = (input_y - CHAT_TOP) / 8;
+        unsigned total = chat_line_count();
+        unsigned end = total > g->scroll ? total - g->scroll : 0;
+        unsigned start = end > lines ? end - lines : 0;
+        chat_render_lines(start, end);
         if (g->stage == CHAT && !g->picker) {
-            size_t len = strlen(g->input); const char *tail = g->input + (len > CHAT_COLS - 2 ? len - (CHAT_COLS - 2) : 0);
-            snprintf(line, sizeof(line), "%c %s", g->shift || g->input_mode == 1 ? 'A' : g->input_mode == 2 ? '0' : 'a', tail);
-            fill(CHAT_X, 216, 230, 8, COL_PANEL); text(CHAT_X, 216, COL_FG, COL_PANEL, line, CHAT_COLS);
+            /* Cursor x comes from gfx_GetTextX() after the real draw call,
+             * since the font is not fixed-width. */
+            char mode = g->shift || g->input_mode == 1 ? 'A' : g->input_mode == 2 ? '0' : 'a';
+            fill(CHAT_X, input_y, 230, input_lines * 8 + 4, COL_PANEL);
+            fill(CHAT_X, input_y, 230, 2, COL_PURPLE);
+            unsigned cursor_x = CHAT_X + 2, cursor_y = input_y + 4;
+            const char *p = g->input;
+            snprintf(line, sizeof(line), "%c %.*s", mode, (int)input_cols0, p);
+            text(CHAT_X + 2, input_y + 4, COL_FG, COL_PANEL, line, CHAT_COLS);
+            cursor_x = (unsigned)gfx_GetTextX(); cursor_y = input_y + 4;
+            p += input_len < input_cols0 ? input_len : input_cols0;
+            for (unsigned row = 1; row < input_lines; ++row) {
+                unsigned y = input_y + 4 + row * 8;
+                text(CHAT_X + 2, y, COL_FG, COL_PANEL, p, CHAT_COLS);
+                cursor_x = (unsigned)gfx_GetTextX(); cursor_y = y;
+                size_t take = strlen(p); if (take > CHAT_COLS) take = CHAT_COLS;
+                p += take;
+            }
+            fill(cursor_x, cursor_y, 6, 8, COL_WARN);
         }
+        if (g->show_help) help();
     }
-    fill(0, 224, 320, 16, COL_PANEL); text(2, 225, COL_FG, COL_PANEL, g->status, 39);
-    text(2, 233, COL_MUTED, COL_PANEL,
-         g->done ? "Up/Down: trace Enter: setup Mode: exit" : "Y=:ch Window:srv Mode:disc Clear:quit", 39);
+    fill(0, 224, 320, 16, COL_PANEL);
+    /* Font is fixed 8px/glyph (gfx_SetMonospaceFont); right-align the hint by
+     * its own character count so it never runs off the 320px-wide screen. */
+    if (g->done) {
+        const char *hint = "Enter:setup Mode:exit";
+        unsigned hint_x = 320 - 2 - (unsigned)strlen(hint) * 8;
+        text(2, 229, COL_FG, COL_PANEL, g->status, (hint_x - 2) / 8);
+        text(hint_x, 229, COL_MUTED, COL_PANEL, hint, 39);
+    } else {
+        const char *hint = "Mode=keys";
+        text(2, 229, COL_MUTED, COL_PANEL, hint, 39);
+        text(2 + ((unsigned)strlen(hint) + 1) * 8, 229, COL_FG, COL_PANEL, g->status, 30);
+    }
     gfx_BlitBuffer(); g->dirty = false;
 }
 static void palette(void) {
     static const uint16_t colors[] = { gfx_RGBTo1555(12, 10, 20), gfx_RGBTo1555(235, 233, 245),
-        gfx_RGBTo1555(28, 23, 43), gfx_RGBTo1555(102, 65, 180), gfx_RGBTo1555(175, 158, 211), gfx_RGBTo1555(255, 105, 120) };
+        gfx_RGBTo1555(28, 23, 43), gfx_RGBTo1555(102, 65, 180), gfx_RGBTo1555(175, 158, 211),
+        gfx_RGBTo1555(255, 105, 120), gfx_RGBTo1555(230, 190, 60) };
     gfx_SetPalette(colors, sizeof(colors), COL_BG);
     gfx_SetMonospaceFont(8); gfx_SetTextScale(1, 1);
 }
@@ -591,8 +763,15 @@ static char input_char(uint8_t key) {
 }
 static void handle_key(uint8_t key) {
     if (!key || g->logout_pending) return;
-    if (key == sk_Clear && g->stage > CONFIRM) { g->done = g->quit = true; clear_selection(); status("Goodbye"); return; }
-    if (key == sk_Mode) { g->done = true; clear_selection(); status("Disconnected"); return; }
+    if (key == sk_Mode && g->stage > CONFIRM) { g->show_help = !g->show_help; g->dirty = true; return; }
+    if (g->show_help) { if (key == sk_Mode || key == sk_Clear) g->show_help = false; g->dirty = true; return; }
+    /* Clear backs out one level: chat -> server picker -> disconnect/exit. */
+    if (key == sk_Clear && g->stage == CHAT && !g->picker) {
+        g->stage = GUILDS; g->picker = true; list_page(0); return;
+    }
+    if (key == sk_Clear && (g->stage == GUILDS || g->picker) && g->stage > CONFIRM) {
+        g->done = g->quit = true; clear_selection(); status("Goodbye"); return;
+    }
     if (key == sk_Graph && g->authed) {
         g->saved.token[0] = 0;
         g->save_pending = true;
@@ -627,12 +806,11 @@ static void handle_key(uint8_t key) {
         if (key == sk_Left && g->page_offset) list_page(g->page_offset >= PAGE ? g->page_offset - PAGE : 0);
         if (key == sk_Right && g->next_page) list_page(g->next_page);
         if (key == sk_Enter) choose();
-        if (key == sk_Clear && g->channel[0]) { g->stage = CHAT; g->picker = false; list_page(0); }
         if (g->cursor < g->top) g->top = g->cursor;
         if (g->cursor >= g->top + 22) g->top = g->cursor - 21;
         g->dirty = true; return;
     }
-    if (key == sk_Up && g->scroll + CHAT_ROWS - 2 < g->row_count) ++g->scroll;
+    if (key == sk_Up && g->scroll + CHAT_LINES < chat_line_count()) ++g->scroll;
     else if (key == sk_Down && g->scroll) --g->scroll;
     else if (key == sk_Trace) { g->refresh_history = g->can_history; }
     else if (!g->send_pending) {
@@ -656,8 +834,27 @@ static void handle_key(uint8_t key) {
     g->dirty = true;
 }
 
+/* Draws one labeled input box: label above, bordered field below holding up
+ * to `rows` wrapped lines of `value` plus a trailing cursor block when active.
+ * The cursor's x position comes from gfx_GetTextX() after the real draw call,
+ * since the font is not fixed-width (a flat column*char-width guess drifts). */
+static unsigned field_box(unsigned y, const char *label, const char *value, bool active, unsigned rows) {
+    text(4, y, COL_MUTED, COL_BG, label, 39);
+    unsigned box_y = y + 10, box_h = rows * 8 + 6;
+    fill(2, box_y, 316, box_h, COL_PANEL);
+    if (active) fill(2, box_y, 2, box_h, COL_PURPLE);
+    size_t len = strlen(value);
+    unsigned cursor_x = 8, cursor_row = 0;
+    for (unsigned i = 0; i < rows; ++i) {
+        size_t off = i * 36; if (off > len) break;
+        text(8, box_y + 3 + i * 8, COL_FG, COL_PANEL, value + off, 36);
+        if (active) { cursor_x = (unsigned)gfx_GetTextX(); cursor_row = i; }
+    }
+    if (active && cursor_row < rows) fill(cursor_x, box_y + 3 + cursor_row * 8, 6, 8, COL_WARN);
+    return box_y + box_h + 6;
+}
 static bool setup(void) {
-    unsigned field = 0; bool redraw = true; char original_target[128], original_user[32];
+    unsigned field = 0; bool redraw = true; char original_target[128], original_user[32], line[80];
     copy(original_target, sizeof(original_target), g->saved.target); copy(original_user, sizeof(original_user), g->saved.username);
     for (;;) {
         lwip_service_events(); uint8_t key = os_GetCSC();
@@ -683,38 +880,40 @@ static bool setup(void) {
         if (redraw) {
             gfx_FillScreen(COL_BG); fill(0, 0, 320, 16, COL_PURPLE);
             text(2, 4, COL_FG, COL_PURPLE, "Discord relay setup", 39);
-            text(2, 28, COL_FG, COL_BG, field ? "  Server / IP / URL:" : "> Server / IP / URL:", 39);
-            /* Long targets remain visible on up to four fixed-width lines. */
-            for (unsigned i = 0; i < 4 && i * 39 < strlen(g->saved.target); ++i) text(2, 40 + i * 8, COL_FG, COL_BG, g->saved.target + i * 39, 39);
-            text(2, 86, COL_FG, COL_BG, field ? "> Username (local profile):" : "  Username (local profile):", 39);
-            text(2, 100, COL_FG, COL_BG, g->saved.username, 39);
-            text(2, 124, COL_MUTED, COL_BG, "Discord identity is verified at login.", 39);
-            text(2, 140, COL_MUTED, COL_BG, "Port 8443 unless set in target line.", 39);
-            text(2, 164, COL_FG, COL_BG, "Alpha: abc/ABC/123   X,T: shift", 39);
-            text(2, 180, COL_FG, COL_BG, g->shift ? "Input: ABC (once)" : g->input_mode == 0 ? "Input: abc" : g->input_mode == 1 ? "Input: ABC" : "Input: 123", 39);
-            text(2, 204, COL_ERROR, COL_BG, g->status, 39);
-            text(2, 224, COL_FG, COL_BG, "Enter: next/connect   Clear: exit", 39);
+            unsigned y = field_box(26, "Server / IP / URL", g->saved.target, field == 0, 4);
+            y = field_box(y, "Username (local profile)", g->saved.username, field == 1, 1);
+            text(4, y, COL_MUTED, COL_BG, "Identity is verified at login.", 39); y += 10;
+            snprintf(line, sizeof(line), "Port %u unless set in the server line.", (unsigned)RELAY_DEFAULT_PORT);
+            text(4, y, COL_MUTED, COL_BG, line, 39); y += 14;
+            text(4, y, COL_FG, COL_BG, "Alpha: abc/ABC/123   X,T: shift once", 39); y += 10;
+            text(4, y, COL_FG, COL_BG, g->shift ? "Input: ABC (once)" : g->input_mode == 0 ? "Input: abc" : g->input_mode == 1 ? "Input: ABC" : "Input: 123", 39);
+            text(4, 204, COL_ERROR, COL_BG, g->status, 39);
+            fill(0, 224, 320, 16, COL_PANEL);
+            text(4, 230, COL_MUTED, COL_PANEL, "Up/Down: switch field  Enter: next/connect  Clear: exit", 39);
             gfx_BlitBuffer(); redraw = false;
         }
     }
 }
 static void run(void) {
-    g->done = g->connected = g->authed = g->created = g->logout_pending = g->network_wait = false;
+    g->done = g->connected = g->authed = g->created = g->logout_pending = g->network_wait = g->show_help = false;
     g->panel[0] = 0; g->rx_len = 0; g->auth_seconds = 0; g->stage = CONNECTING;
     g->stack_error[0] = g->tls_step[0] = g->failure_phase[0] = 0;
     g->traceback_count = g->traceback_scroll = 0;
+    memset(g->step_state, STEP_PENDING, sizeof(g->step_state));
     clear_selection(); g->guild_name[0] = g->channel_name[0] = 0;
     g->socket = lwip_socket_create(LWIP_SOCKET_ALTCP_TLS, LWIP_NETIF_EXT, NULL, 45000u);
     if (!g->socket) { fail("Socket create failed"); return; } g->created = true;
     lwip_socket_on_event(g->socket, LWIP_SOCKET_EVENTF_ALL, event, NULL);
     /* Start services on this socket's interface. Poll readiness from our own
-     * loop so no callback outlives the connection during teardown. */
+     * loop so no callback outlives the connection during teardown; the
+     * per-service callback only drives the step indicators. */
     lwip_error_t err = lwip_netif_request_services(lwip_socket_get_netif(g->socket),
                                       LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS |
                                           LWIP_SOCKET_SVC_SNTP,
-                                      45000u, NULL, NULL);
+                                      45000u, service_event, NULL);
     if (err != LWIP_OK)
     {
+        g->step_state[STEP_DHCP] = g->step_state[STEP_DNS] = g->step_state[STEP_SNTP] = STEP_FAILED;
         fail("Network service request failed");
         return;
     }
@@ -727,8 +926,17 @@ static void run(void) {
         uint32_t now = lwip_now_ms();
         if (g->network_wait)
         {
+            lwip_netif_info_t info;
+            if (g->step_state[STEP_NETWORK] == STEP_PENDING && lwip_default_netif_info(&info) && info.link_up)
+            {
+                g->step_state[STEP_NETWORK] = STEP_OK; g->dirty = true;
+            }
             if ((uint32_t)(now - g->network_started) >= 45000UL)
+            {
+                for (conn_step_t s = STEP_NETWORK; s <= STEP_SNTP; ++s)
+                    if (g->step_state[s] == STEP_PENDING) g->step_state[s] = STEP_FAILED;
                 fail("Network timeout");
+            }
             else if (lwip_are_services_ready(lwip_socket_get_netif(g->socket),
                                              LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS |
                                                  LWIP_SOCKET_SVC_SNTP))
@@ -737,7 +945,10 @@ static void run(void) {
                 status("Connecting to %.45s:%u", g->host, (unsigned)g->port);
                 err = lwip_socket_connect(g->socket, g->host, g->port);
                 if (err != LWIP_OK)
+                {
+                    g->step_state[STEP_CONNECT] = STEP_FAILED;
                     fail("Connection failed");
+                }
                 else
                     g->last_ping = g->last_rx = g->request_time = now;
             }

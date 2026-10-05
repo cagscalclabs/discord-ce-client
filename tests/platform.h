@@ -13,6 +13,11 @@ typedef int lwip_socket_event_type_t;
 struct netif { int unused; };
 typedef struct { uint8_t service_id, status, ready_bitmap; } lwip_netif_service_event_t;
 enum { LWIP_NETIF_SERVICE_UP, LWIP_NETIF_SERVICE_FAILED, LWIP_NETIF_SERVICE_TIMEOUT };
+typedef struct { bool has_netif, up, link_up; } lwip_netif_info_t;
+static bool test_link_up = true;
+static bool lwip_default_netif_info(lwip_netif_info_t *info) {
+    info->has_netif = true; info->up = true; info->link_up = test_link_up; return true;
+}
 struct lwip_socket;
 typedef struct { int current; } lwip_socket_state_data_t;
 typedef struct { uint16_t component, operation; int raw_error; lwip_error_t err; int status; } lwip_socket_error_data_t;
@@ -37,7 +42,7 @@ enum { LWIP_OK, LWIP_SOCKET_ALTCP_TLS, LWIP_NETIF_EXT, LWIP_SOCKET_EV_ERROR,
 #define LWIP_SOCKET_SVC_DNS 2
 #define LWIP_SOCKET_SVC_SNTP 4
 enum { sk_Mode=1, sk_Graph, sk_Clear, sk_Up, sk_Down, sk_Enter, sk_Window,
-       sk_Yequ, sk_Left, sk_Right, sk_Trace, sk_Del, sk_Alpha, sk_GraphVar };
+       sk_Yequ, sk_Left, sk_Right, sk_Trace, sk_Del, sk_Alpha, sk_GraphVar, sk_Math };
 #ifndef SEEK_SET
 #define SEEK_SET 0
 #define SEEK_CUR 1
@@ -95,8 +100,22 @@ static void lwip_socket_on_event(struct lwip_socket *s, int t, void (*cb)(struct
 static lwip_error_t test_service_error;
 static int test_service_flags;
 static bool test_services_ready = true;
+typedef void (*test_service_cb)(struct netif *, const lwip_netif_service_event_t *, void *);
+static test_service_cb test_pending_cb; static void *test_pending_cb_arg;
 static int lwip_netif_request_services(void *n, int f, unsigned long t, void *cb, void *arg) {
-    (void)n;(void)t;(void)cb;(void)arg; test_service_flags = f; return test_service_error;
+    (void)n;(void)t; test_service_flags = f;
+    test_pending_cb = (test_service_cb)cb; test_pending_cb_arg = arg;
+    return test_service_error;
+}
+/* Test helper: fires the per-service callback as the real stack would,
+ * one event per bit in `flags`, carrying the given status. */
+static void test_fire_service(int flags, uint8_t status, uint8_t ready_bitmap) {
+    if (!test_pending_cb) return;
+    for (int bit = 1; bit <= LWIP_SOCKET_SVC_SNTP; bit <<= 1) {
+        if (!(flags & bit)) continue;
+        lwip_netif_service_event_t ev = { (uint8_t)bit, status, ready_bitmap };
+        test_pending_cb(NULL, &ev, test_pending_cb_arg);
+    }
 }
 static bool lwip_are_services_ready(void *n, int f) { (void)n; (void)f; return test_services_ready; }
 static int lwip_socket_connect(struct lwip_socket *s, const char *h, uint16_t p) { (void)s;(void)h;(void)p; return 0; }
@@ -117,12 +136,14 @@ static void mem_free(void *p) { free(p); }
 #define gfx_RGBTo1555(r,g,b) 0
 static void gfx_SetTextFGColor(uint8_t c) { (void)c; }
 static void gfx_SetTextBGColor(uint8_t c) { (void)c; }
-static void gfx_PrintStringXY(const char *t, int x, int y) { (void)t;(void)x;(void)y; }
+static int test_text_x;
+static void gfx_PrintStringXY(const char *t, int x, int y) { (void)y; test_text_x = x + (int)strlen(t ? t : "") * 8; }
+static int gfx_GetTextX(void) { return test_text_x; }
 static void gfx_SetColor(uint8_t c) { (void)c; }
 static void gfx_FillRectangle(int x, int y, int w, int h) { (void)x;(void)y;(void)w;(void)h; }
 static void gfx_FillScreen(uint8_t c) { (void)c; }
 static void gfx_BlitBuffer(void) {}
-static void gfx_SetPalette(const uint16_t *p, size_t n, unsigned off) { (void)p; assert(n == 12 && off == 16); }
+static void gfx_SetPalette(const uint16_t *p, size_t n, unsigned off) { (void)p; assert(n == 14 && off == 16); }
 static void gfx_SetMonospaceFont(unsigned n) { (void)n; }
 static void gfx_SetTextScale(int x, int y) { (void)x;(void)y; }
 #endif
