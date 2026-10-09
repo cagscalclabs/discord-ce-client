@@ -94,7 +94,6 @@ static lwip_error_t lwip_socket_write(struct lwip_socket *s, const uint8_t *p, s
 }
 static struct lwip_socket *lwip_socket_stub_obj;
 static struct lwip_socket *lwip_socket_create(int t, int b, void *a, unsigned long ms) { (void)t;(void)b;(void)a;(void)ms; return lwip_socket_stub_obj; }
-static lwip_error_t lwip_socket_last_error(const struct lwip_socket *s) { (void)s; return LWIP_OK; }
 static struct netif *lwip_socket_get_netif(const struct lwip_socket *s) { (void)s; return NULL; }
 static void lwip_socket_on_event(struct lwip_socket *s, int t, void (*cb)(struct lwip_socket *, int, const void *, void *), void *arg) { (void)s;(void)t;(void)cb;(void)arg; }
 static lwip_error_t test_service_error;

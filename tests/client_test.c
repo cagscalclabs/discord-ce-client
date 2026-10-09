@@ -158,21 +158,21 @@ static void test_network_diagnostics(void) {
     trace.data.code.extra = 40; stack_event(&trace);
     trace.data.code.loc = (2UL << 24) | 456; stack_event(&trace);
     lwip_socket_error_data_t error = { .component = 6, .operation = 4, .raw_error = -13, .err = 6 };
-    event(&g->socket, LWIP_SOCKET_EV_ERROR, &error, NULL);
+    event(g->socket, LWIP_SOCKET_EV_ERROR, &error, NULL);
     assert(g->done && !g->connected);
     assert(!strcmp(g->failure_phase, "Before TLS connected"));
     assert(!strcmp(g->tls_step, "serverhello: fail"));
     assert(!strcmp(g->stack_error, "handshake.c:456 x40"));
     assert(!strcmp(g->status, "Net err c6 o4 r-13 e6"));
     lwip_socket_state_data_t state = { .current = LWIP_STATUS_CLOSED };
-    event(&g->socket, LWIP_SOCKET_EV_STATE_CHANGE, &state, NULL);
+    event(g->socket, LWIP_SOCKET_EV_STATE_CHANGE, &state, NULL);
     state.current = LWIP_STATUS_CONNECTED;
-    event(&g->socket, LWIP_SOCKET_EV_STATE_CHANGE, &state, NULL);
+    event(g->socket, LWIP_SOCKET_EV_STATE_CHANGE, &state, NULL);
     assert(!g->connected && !strcmp(g->status, "Net err c6 o4 r-13 e6"));
     reset(); g->stage = CONNECTING; g->connected = true;
-    event(&g->socket, LWIP_SOCKET_EV_ERROR, &error, NULL);
+    event(g->socket, LWIP_SOCKET_EV_ERROR, &error, NULL);
     assert(!strcmp(g->failure_phase, "Waiting for relay hello"));
-    reset(); event(&g->socket, LWIP_SOCKET_EV_ERROR, NULL, NULL);
+    reset(); event(g->socket, LWIP_SOCKET_EV_ERROR, NULL, NULL);
     assert(g->done && !strcmp(g->status, "Network error; no details"));
     reset(); g->created = true;
     trace.module = 0; trace.kind = LWIP_EV_ERROR; trace.data.code.loc = (3UL << 24) | 439;
@@ -187,12 +187,30 @@ static void test_network_diagnostics(void) {
     assert(test_service_flags == (LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS | LWIP_SOCKET_SVC_SNTP));
     test_service_error = LWIP_OK;
 }
+static void test_connection_steps(void) {
+    /* Per-service callback drives each step independently; link-up and the
+     * final TLS connect are driven by lwip_default_netif_info()/event(). */
+    reset();
+    memset(g->step_state, STEP_PENDING, sizeof(g->step_state));
+    lwip_netif_request_services(lwip_socket_get_netif(g->socket),
+        LWIP_SOCKET_SVC_DHCP | LWIP_SOCKET_SVC_DNS | LWIP_SOCKET_SVC_SNTP,
+        45000u, service_event, NULL);
+    test_fire_service(LWIP_SOCKET_SVC_DHCP, LWIP_NETIF_SERVICE_UP, LWIP_SOCKET_SVC_DHCP);
+    test_fire_service(LWIP_SOCKET_SVC_DNS, LWIP_NETIF_SERVICE_FAILED, 0);
+    assert(g->step_state[STEP_DHCP] == STEP_OK);
+    assert(g->step_state[STEP_DNS] == STEP_FAILED);
+    assert(g->step_state[STEP_SNTP] == STEP_PENDING);
+    lwip_socket_state_data_t connected = { .current = LWIP_STATUS_CONNECTED };
+    g->stage = CONNECTING;
+    event(g->socket, LWIP_SOCKET_EV_STATE_CHANGE, &connected, NULL);
+    assert(g->step_state[STEP_CONNECT] == STEP_OK);
+}
 int main(void) {
     palette();
     test_wire(); test_targets(); test_login(); test_resume_fallback_and_profile_binding();
     test_channel_negotiation(); test_history_live_merge_and_delete(); test_send_ack_and_fragmented_frames();
     test_pagination_and_stale_replies(); test_bounded_parser_and_transcript();
-    test_network_diagnostics();
-    printf("10 client test groups passed; state size %zu bytes (host ABI)\n", sizeof(app_t));
+    test_network_diagnostics(); test_connection_steps();
+    printf("11 client test groups passed; state size %zu bytes (host ABI)\n", sizeof(app_t));
     return 0;
 }
