@@ -46,6 +46,6 @@ Relay sessions expire, rotate on resume, and can be revoked locally. Provider lo
 | `src/main.c` | Purple/black channel/chat UI; device login, account confirmation, session resume; relay protocol over TLS. |
 | Channel selection | Mutual-server selection, stable channel IDs, user/bot permission checks, one active connection per Discord user. |
 | TLS | Relay requires TLS 1.3; compatibility with Alessio's profile and the calculator needs verification. |
-| Build | CE toolchain and installed lwIP headers/library; `LWIP_CE` selects the checkout containing the shared example helper. Produces `bin/DISC.8xp`. |
+| Build | CE toolchain and installed lwIP headers/library. `src/lwip_example.h` is vendored directly in this repo. Produces `bin/DISC.8xp`. |
 
 Client state-machine tests run on the host with AddressSanitizer and UBSan. Relay tests use simulated Discord/provider responses and localhost TLS. Hardware and live OIDC integration are verified working. The inspected lwIP checkout has a [certificate trust limitation](CLIENT.md#tls-dependency-status) to resolve before production credentials are used.
